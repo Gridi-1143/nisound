@@ -1,5 +1,5 @@
 {
-  description = "Linux Soundboard in Rust for NixOS";
+  description = "Dev env for Nisound for NixOS";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -26,6 +26,7 @@
         libXrender
         libXext
         libXinerama
+        libXtst
       ];
     in {
       devShells.${system}.default = pkgs.mkShell {
