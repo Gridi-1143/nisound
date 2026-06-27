@@ -12,7 +12,6 @@
       overlays = [ (import rust-overlay) ];
       pkgs = import nixpkgs { inherit system overlays; };
 
-      # for eframe/winit, rodio
       runtimeLibs = with pkgs; [
         alsa-lib
         libxkbcommon
@@ -27,6 +26,7 @@
         libXext
         libXinerama
         libXtst
+        mesa
       ];
     in {
       devShells.${system}.default = pkgs.mkShell {
@@ -41,7 +41,8 @@
 
         shellHook = ''
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibs}:$LD_LIBRARY_PATH"
-          echo " Nisound Dev Environment Loaded! Run 'cargo run' to start."
+          echo "Nisound Dev Environment Loaded! Run 'cargo run' to start.
+          If you don't use NixOS and have errors with libs use: 'ALSA_PLUGIN_DIR=/usr/lib/alsa-lib/ LD_LIBRARY_PATH="\$LD_LIBRARY_PATH:/usr/lib" cargo run' "
         '';
       };
 
