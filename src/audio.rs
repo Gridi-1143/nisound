@@ -29,6 +29,12 @@ impl PulseSink {
     }
 }
 
+impl Drop for PulseSink {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub struct ActiveSound {
     pub play_id: Uuid,
     pub sound_id: Uuid,
@@ -169,7 +175,12 @@ impl AudioEngine {
                 }
             }
 
-            let _ = simple.drain();
+            if thread_stop.load(Ordering::Relaxed) {
+                let _ = simple.flush();
+            } else {
+                let _ = simple.drain();
+            }
+
             thread_finished.store(true, Ordering::Relaxed);
         });
 
