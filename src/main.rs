@@ -1,6 +1,7 @@
 mod config;
 mod audio;
 mod ui;
+mod pulse_devices;
 
 use eframe::egui;
 use std::sync::mpsc::{Receiver, Sender};

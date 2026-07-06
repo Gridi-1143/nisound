@@ -1,5 +1,6 @@
 use crate::audio::AudioEngine;
 use crate::config::{AppState, Folder, SoundEntry};
+use crate::pulse_devices::{self, AudioDevice, DeviceFilter};
 use egui::{Color32, Context, Ui};
 use std::collections::HashSet;
 use std::fs;
@@ -39,7 +40,10 @@ pub struct SoundboardApp {
     pub show_settings: bool,
     pub active_settings_tab: usize,
     pub hotkey_rx: Option<std::sync::mpsc::Receiver<crate::GlobalEvent>>,
-    available_devices: Vec<String>,
+    output_devices: Vec<AudioDevice>,
+    input_devices: Vec<AudioDevice>,
+    output_filter: DeviceFilter,
+    input_filter: DeviceFilter,
     pending_folder_import: Option<FolderImportRequest>,
     active_sound_popup: Option<Uuid>,
     active_sound_popup_tab: usize,
@@ -58,10 +62,14 @@ pub struct SoundboardApp {
 
 impl SoundboardApp {
     pub fn new(state: AppState) -> Self {
+        let (output_devices, input_devices) = pulse_devices::list_devices();
         Self {
             state,
             audio: AudioEngine::init(),
-            available_devices: AudioEngine::available_output_devices(),
+            output_devices,
+            input_devices,
+            output_filter: DeviceFilter::All,
+            input_filter: DeviceFilter::All,
             hotkey_rx: None,
             selected_sounds: HashSet::new(),
             show_settings: false,
@@ -81,6 +89,20 @@ impl SoundboardApp {
             keybind_capture: None,
             stop_all_hotkey: None,
         }
+    }
+
+    fn refresh_devices(&mut self) {
+        let (outputs, inputs) = pulse_devices::list_devices();
+        self.output_devices = outputs;
+        self.input_devices = inputs;
+    }
+
+    fn device_label<'a>(devices: &'a [AudioDevice], name: &'a str) -> &'a str {
+        devices
+            .iter()
+            .find(|d| d.name == name)
+            .map(|d| d.description.as_str())
+            .unwrap_or(name)
     }
 
     fn execute_action(&mut self, action: PendingAction) {
@@ -145,39 +167,63 @@ impl SoundboardApp {
                 }
 
                 ui.separator();
-                ui.label("Out (Headphones):");
+                ui.label("Headphones (out):");
                 let mut out_changed = false;
+                let out_label = Self::device_label(&self.output_devices, &self.state.settings.default_output).to_string();
                 egui::ComboBox::from_id_source("def_out")
-                    .selected_text(&self.state.settings.default_output)
+                    .selected_text(out_label)
                     .show_ui(ui, |ui| {
-                        for dev in &self.available_devices {
-                            out_changed |= ui
-                                .selectable_value(
-                                    &mut self.state.settings.default_output,
-                                    dev.clone(),
-                                    dev,
-                                )
-                                .changed();
-                        }
+                        out_changed |= ui
+                            .selectable_value(
+                                &mut self.state.settings.default_output,
+                                crate::audio::DEFAULT_DEVICE.to_string(),
+                                "Default",
+                            )
+                            .changed();
+                        for dev in self
+                            .output_devices
+                                .iter()
+                                .filter(|d| self.output_filter.matches(d))
+                                {
+                                    out_changed |= ui
+                                        .selectable_value(
+                                            &mut self.state.settings.default_output,
+                                            dev.name.clone(),
+                                            &dev.description,
+                                        )
+                                        .changed();
+                                    }
                     });
                 if out_changed {
                     self.state.save();
                 }
 
-                ui.label("Out (Virtual Mic):");
+                ui.label("Virtual mic (inp):");
                 let mut in_changed = false;
+                let in_label = Self::device_label(&self.input_devices, &self.state.settings.default_input).to_string();
                 egui::ComboBox::from_id_source("def_in")
-                    .selected_text(&self.state.settings.default_input)
+                    .selected_text(in_label)
                     .show_ui(ui, |ui| {
-                        for dev in &self.available_devices {
-                            in_changed |= ui
-                                .selectable_value(
-                                    &mut self.state.settings.default_input,
-                                    dev.clone(),
-                                    dev,
-                                )
-                                .changed();
-                        }
+                        in_changed |= ui
+                            .selectable_value(
+                                &mut self.state.settings.default_input,
+                                crate::audio::DEFAULT_DEVICE.to_string(),
+                                "Default",
+                            )
+                            .changed();
+                        for dev in self
+                            .input_devices
+                                .iter()
+                                .filter(|d| self.input_filter.matches(d))
+                                {
+                                    in_changed |= ui
+                                        .selectable_value(
+                                            &mut self.state.settings.default_input,
+                                            dev.name.clone(),
+                                            &dev.description,
+                                        )
+                                        .changed();
+                                    }
                     });
                 if in_changed {
                     self.state.save();
@@ -445,6 +491,8 @@ impl SoundboardApp {
 
         // ── GENERAL SETTINGS WINDOW ──────────────────────────────────────────
         if self.show_settings {
+            let mut want_refresh_devices = false;
+
             egui::Window::new("General Settings")
                 .open(&mut self.show_settings)
                 .show(ctx, |ui| {
@@ -456,17 +504,48 @@ impl SoundboardApp {
 
                     match self.active_settings_tab {
                         0 => {
-                            ui.label("Advanced Routing Configurations System");
+                            ui.label("Audio-devices");
+
+                            if ui.button("🔄 Update device list").clicked() {
+                                want_refresh_devices = true;
+                            }
+
+                            ui.separator();
+                            ui.label("Output (Headphones):");
+                            ui.horizontal(|ui| {
+                                ui.label("Show:");
+                                egui::ComboBox::from_id_source("output_filter")
+                                    .selected_text(self.output_filter.label())
+                                    .show_ui(ui, |ui| {
+                                        for f in DeviceFilter::ALL_OUTPUT {
+                                            ui.selectable_value(&mut self.output_filter, f, f.label());
+                                        }
+                                    });
+                            });
                             ui.label(format!(
-                                "Current output route: {}",
-                                self.state.settings.default_output
+                                    "Current output: {}",
+                                    Self::device_label(&self.output_devices, &self.state.settings.default_output)
                             ));
+
+                            ui.separator();
+                            ui.label("Input (Microphone):");
+                            ui.horizontal(|ui| {
+                                ui.label("Show:");
+                                egui::ComboBox::from_id_source("input_filter")
+                                    .selected_text(self.input_filter.label())
+                                    .show_ui(ui, |ui| {
+                                        for f in DeviceFilter::ALL_INPUT {
+                                            ui.selectable_value(&mut self.input_filter, f, f.label());
+                                        }
+                                    });
+                            });
                             ui.label(format!(
-                                "Current input route: {}",
-                                self.state.settings.default_input
+                                    "Current input: {}",
+                                    Self::device_label(&self.input_devices, &self.state.settings.default_input)
                             ));
                         }
                         1 => {
+                            // ── без змін: Theme Color Editor лишається як був ──
                             ui.label("Theme Color Editor");
                             let mut changed = false;
                             for (key, color) in self.state.settings.colors.iter_mut() {
@@ -482,7 +561,12 @@ impl SoundboardApp {
                         _ => {}
                     }
                 });
+
+            if want_refresh_devices {
+                self.refresh_devices();
+            }
         }
+
 
         self.render_folder_import_prompt(ctx);
         self.render_sound_popup(ctx);

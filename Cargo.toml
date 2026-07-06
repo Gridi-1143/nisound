@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+libpulse-binding = "2.28"
+libpulse-simple-binding = "2.28"
 egui = "0.27.2"
 eframe = { version = "0.27.2", features = ["serde"] }
 rodio = "0.18.0"

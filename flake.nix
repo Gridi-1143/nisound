@@ -27,6 +27,7 @@
         libXext
         libXinerama
         libXtst
+        libpulseaudio
       ];
     in {
       devShells.${system}.default = pkgs.mkShell {

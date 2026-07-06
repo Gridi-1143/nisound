@@ -1,67 +1,55 @@
-use rodio::{cpal::traits::{DeviceTrait, HostTrait}, Decoder, OutputStream, OutputStreamHandle, Sink};
-use std::collections::HashMap;
+use libpulse_binding::sample::{Format, Spec};
+use libpulse_binding::stream::Direction;
+use libpulse_simple_binding::Simple;
+use rodio::{Decoder, Source};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+
+/// A single output stream feeding one PulseAudio sink or source (monitor).
+/// Replaces the old rodio::Sink — same "fire and forget + poll" API
+/// (`stop()` / `empty()`), but writes PCM straight to Pulse/PipeWire so it
+/// can target any named device (e.g. "alsa_output.pci-..." or a virtual
+/// mic sink), not just what cpal happens to enumerate on the ALSA host.
+pub struct PulseSink {
+    stop_flag: Arc<AtomicBool>,
+    finished_flag: Arc<AtomicBool>,
+}
+
+impl PulseSink {
+    pub fn stop(&self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
+    }
+
+    pub fn empty(&self) -> bool {
+        self.finished_flag.load(Ordering::Relaxed)
+    }
+}
 
 pub struct ActiveSound {
     pub play_id: Uuid,
     pub sound_id: Uuid,
     pub name: String,
-    pub sinks: Vec<Sink>,
+    pub sinks: Vec<PulseSink>,
 }
 
 pub struct AudioEngine {
-    streams: Arc<Mutex<HashMap<String, (OutputStream, OutputStreamHandle)>>>,
     pub active_sounds: Arc<Mutex<Vec<ActiveSound>>>,
 }
+
+/// Sentinel value meaning "let PulseAudio/PipeWire pick the default
+/// device", used both as the initial config value and as a synthetic
+/// entry the UI prepends to the device list.
+pub const DEFAULT_DEVICE: &str = "Default";
 
 impl AudioEngine {
     pub fn init() -> Self {
         Self {
-            streams: Arc::new(Mutex::new(HashMap::new())),
             active_sounds: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    pub fn available_output_devices() -> Vec<String> {
-        let mut devices = vec!["Default".to_string()];
-        let host = rodio::cpal::default_host();
-        if let Ok(devs) = host.output_devices() {
-            for dev in devs {
-                if let Ok(name) = dev.name() {
-                    devices.push(name);
-                }
-            }
-        }
-        devices
-    }
-
-    fn get_or_create_stream(&self, device_name: &str) -> Option<OutputStreamHandle> {
-        let mut streams = self.streams.lock().unwrap();
-
-        if let Some((_, handle)) = streams.get(device_name) {
-            return Some(handle.clone());
-        }
-
-        let host = rodio::cpal::default_host();
-        let device = if device_name == "Default" {
-            host.default_output_device()
-        } else {
-            host.output_devices()
-                .ok()?
-                .find(|d| d.name().unwrap_or_default() == device_name)
-        };
-
-        if let Some(dev) = device {
-            if let Ok((stream, handle)) = OutputStream::try_from_device(&dev) {
-                streams.insert(device_name.to_string(), (stream, handle.clone()));
-                return Some(handle);
-            }
-        }
-        None
     }
 
     pub fn play_sound(
@@ -107,14 +95,88 @@ impl AudioEngine {
         }
     }
 
-    fn spawn_sink(&self, path: &Path, volume: f32, device_name: &str) -> Option<Sink> {
+    /// Opens a fresh Pulse/PipeWire playback stream targeting `device_name`
+    /// (a technical Pulse name like "alsa_output.pci-0000_00_1f.3.analog-stereo",
+    /// or DEFAULT_DEVICE to let the server pick), decodes `path` with rodio,
+    /// and streams PCM into it on a background thread.
+    fn spawn_sink(&self, path: &Path, volume: f32, device_name: &str) -> Option<PulseSink> {
         let file = File::open(path).ok()?;
-        let source = Decoder::new(BufReader::new(file)).ok()?;
-        let handle = self.get_or_create_stream(device_name)?;
-        let sink = Sink::try_new(&handle).ok()?;
-        sink.set_volume(volume);
-        sink.append(source);
-        Some(sink)
+        let decoder = Decoder::new(BufReader::new(file)).ok()?;
+
+        let channels = decoder.channels();
+        let sample_rate = decoder.sample_rate();
+
+        let spec = Spec {
+            format: Format::S16NE,
+            channels: channels as u8,
+            rate: sample_rate,
+        };
+        if !spec.is_valid() {
+            return None;
+        }
+
+        let device = if device_name.is_empty() || device_name == DEFAULT_DEVICE {
+            None
+        } else {
+            Some(device_name)
+        };
+
+        let simple = Simple::new(
+            None, // default server (works for both PulseAudio and pipewire-pulse)
+            "Nisound",
+            Direction::Playback,
+            device,
+            "sound effect",
+            &spec,
+            None,
+            None,
+        )
+        .ok()?;
+
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let finished_flag = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop_flag.clone();
+        let thread_finished = finished_flag.clone();
+        let volume = volume.clamp(0.0, 2.0);
+
+        std::thread::spawn(move || {
+            const CHUNK_FRAMES: usize = 1024;
+            let chunk_samples = CHUNK_FRAMES * channels as usize;
+            let mut decoder = decoder;
+            let mut byte_buf: Vec<u8> = Vec::with_capacity(chunk_samples * 2);
+
+            'outer: loop {
+                byte_buf.clear();
+                for _ in 0..chunk_samples {
+                    match decoder.next() {
+                        Some(sample) => {
+                            let scaled = (sample as f32 * volume)
+                                .clamp(i16::MIN as f32, i16::MAX as f32)
+                                as i16;
+                            byte_buf.extend_from_slice(&scaled.to_ne_bytes());
+                        }
+                        None => break 'outer,
+                    }
+                    if thread_stop.load(Ordering::Relaxed) {
+                        break 'outer;
+                    }
+                }
+                if byte_buf.is_empty() {
+                    break;
+                }
+                if simple.write(&byte_buf).is_err() {
+                    break;
+                }
+            }
+
+            let _ = simple.drain();
+            thread_finished.store(true, Ordering::Relaxed);
+        });
+
+        Some(PulseSink {
+            stop_flag,
+            finished_flag,
+        })
     }
 
     pub fn stop_sound(&self, play_id: Uuid) {
