@@ -1,11 +1,19 @@
 use crate::audio::AudioEngine;
 use crate::config::{AppState, Folder, SoundEntry};
-use crate::pulse_devices::{self, AudioDevice, DeviceFilter};
+use crate::pulse_devices::{self, AudioDevice, DeviceFilter, DeviceKind};
 use egui::{Color32, Context, Ui};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+#[derive(Clone, Copy, PartialEq)]
+enum SortOrder {
+    TimeAsc,
+    TimeDesc,
+    AlphaAsc,
+    AlphaDesc,
+}
 
 #[derive(Clone)]
 struct FolderImportRequest {
@@ -40,10 +48,14 @@ pub struct SoundboardApp {
     pub show_settings: bool,
     pub active_settings_tab: usize,
     pub hotkey_rx: Option<std::sync::mpsc::Receiver<crate::GlobalEvent>>,
+    pub search_query: String,
+    sort_order: SortOrder,
     output_devices: Vec<AudioDevice>,
     input_devices: Vec<AudioDevice>,
     output_filter: DeviceFilter,
-    input_filter: DeviceFilter,
+    mic_filter: DeviceFilter,
+    mic_channel_exists: bool,
+    mic_loopback_active: bool,
     pending_folder_import: Option<FolderImportRequest>,
     active_sound_popup: Option<Uuid>,
     active_sound_popup_tab: usize,
@@ -62,15 +74,28 @@ pub struct SoundboardApp {
 
 impl SoundboardApp {
     pub fn new(state: AppState) -> Self {
+        pulse_devices::ensure_mic_channel();
+
         let (output_devices, input_devices) = pulse_devices::list_devices();
+
+        if state.settings.mic_loopback_enabled {
+            pulse_devices::set_mic_loopback(true, &state.settings.mic_loopback_source);
+        }
+
+        let (mic_channel_exists, mic_loopback_active) = pulse_devices::mic_channel_status();
+
         Self {
             state,
             audio: AudioEngine::init(),
             output_devices,
             input_devices,
             output_filter: DeviceFilter::All,
-            input_filter: DeviceFilter::All,
+            mic_filter: DeviceFilter::All,
+            mic_channel_exists,
+            mic_loopback_active,
             hotkey_rx: None,
+            search_query: String::new(),
+            sort_order: SortOrder::TimeDesc,
             selected_sounds: HashSet::new(),
             show_settings: false,
             active_settings_tab: 0,
@@ -91,10 +116,20 @@ impl SoundboardApp {
         }
     }
 
+    pub fn shutdown(&self) {
+        pulse_devices::remove_mic_channel();
+    }
+
     fn refresh_devices(&mut self) {
         let (outputs, inputs) = pulse_devices::list_devices();
         self.output_devices = outputs;
         self.input_devices = inputs;
+    }
+
+    fn refresh_mic_channel_status(&mut self) {
+        let (exists, loopback) = pulse_devices::mic_channel_status();
+        self.mic_channel_exists = exists;
+        self.mic_loopback_active = loopback;
     }
 
     fn device_label<'a>(devices: &'a [AudioDevice], name: &'a str) -> &'a str {
@@ -136,6 +171,26 @@ impl SoundboardApp {
     pub fn render_ui(&mut self, ctx: &Context) {
         self.audio.clean_dead_sinks();
 
+        // ── ОБРОБКА КЛАВІШІ ENTER ───────────────────────────────────────────────
+        if ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Some(sound_id) = self.last_selected_sound {
+                if let Some(sound) = self.state.sounds.get(&sound_id).cloned() {
+                    self.audio.play_sound(
+                        sound.id,
+                        &sound.name,
+                        &sound.path,
+                        sound.volume_playback,
+                        sound.volume_out,
+                        sound.headphones_enabled,
+                        sound.mic_enabled,
+                        &self.state.settings.default_output,
+                        &self.state.settings.mic_sink,
+                        self.state.settings.allow_overlap,
+                    );
+                }
+            }
+        }
+
         // ── TOP TOOLBAR ──────────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -167,71 +222,100 @@ impl SoundboardApp {
                 }
 
                 ui.separator();
-                ui.label("Headphones (out):");
-                let mut out_changed = false;
-                let out_label = Self::device_label(&self.output_devices, &self.state.settings.default_output).to_string();
-                egui::ComboBox::from_id_source("def_out")
-                    .selected_text(out_label)
-                    .show_ui(ui, |ui| {
-                        out_changed |= ui
-                            .selectable_value(
-                                &mut self.state.settings.default_output,
-                                crate::audio::DEFAULT_DEVICE.to_string(),
-                                "Default",
-                            )
-                            .changed();
-                        for dev in self
-                            .output_devices
-                                .iter()
-                                .filter(|d| self.output_filter.matches(d))
-                                {
-                                    out_changed |= ui
-                                        .selectable_value(
-                                            &mut self.state.settings.default_output,
-                                            dev.name.clone(),
-                                            &dev.description,
-                                        )
-                                        .changed();
-                                    }
-                    });
-                if out_changed {
-                    self.state.save();
-                }
 
-                ui.label("Virtual mic (inp):");
-                let mut in_changed = false;
-                let in_label = Self::device_label(&self.input_devices, &self.state.settings.default_input).to_string();
-                egui::ComboBox::from_id_source("def_in")
-                    .selected_text(in_label)
+                ui.label("To others (mic):");
+                let mut mic_changed = false;
+                let mic_label = Self::device_label(&self.output_devices, &self.state.settings.mic_sink).to_string();
+                egui::ComboBox::from_id_source("def_mic")
+                    .selected_text(mic_label)
                     .show_ui(ui, |ui| {
-                        in_changed |= ui
+                        mic_changed |= ui
                             .selectable_value(
-                                &mut self.state.settings.default_input,
+                                &mut self.state.settings.mic_sink,
                                 crate::audio::DEFAULT_DEVICE.to_string(),
                                 "Default",
                             )
                             .changed();
-                        for dev in self
-                            .input_devices
-                                .iter()
-                                .filter(|d| self.input_filter.matches(d))
-                                {
-                                    in_changed |= ui
-                                        .selectable_value(
-                                            &mut self.state.settings.default_input,
-                                            dev.name.clone(),
-                                            &dev.description,
-                                        )
-                                        .changed();
-                                    }
+                        for dev in self.output_devices.iter() {
+                            mic_changed |= ui
+                                .selectable_value(
+                                    &mut self.state.settings.mic_sink,
+                                    dev.name.clone(),
+                                    &dev.description,
+                                )
+                                .changed();
+                        }
                     });
-                if in_changed {
+                if mic_changed {
                     self.state.save();
                 }
 
                 ui.separator();
-                if ui.button("🎙 Record (Stub)").clicked() {}
 
+                ui.label("Mix voice in:");
+                let loopback_label = Self::device_label(
+                    &self.input_devices,
+                    &self.state.settings.mic_loopback_source,
+                )
+                .to_string();
+                
+                let mut loopback_source_changed = false;
+                egui::ComboBox::from_id_source("top_loopback_source")
+                    .selected_text(loopback_label)
+                    .show_ui(ui, |ui| {
+                        loopback_source_changed |= ui.selectable_value(
+                            &mut self.state.settings.mic_loopback_source,
+                            crate::audio::DEFAULT_DEVICE.to_string(),
+                            "Default",
+                        ).changed();
+                        for dev in self.input_devices.iter().filter(|d| d.kind != DeviceKind::Monitor) {
+                            loopback_source_changed |= ui.selectable_value(
+                                &mut self.state.settings.mic_loopback_source,
+                                dev.name.clone(),
+                                &dev.description,
+                            ).changed();
+                        }
+                    });
+
+                if loopback_source_changed {
+                    if self.mic_loopback_active {
+                        let ok = pulse_devices::set_mic_loopback(
+                            true,
+                            &self.state.settings.mic_loopback_source,
+                        );
+                        if !ok {
+                            self.error_message = Some("Couldn't update voice loopback source.".to_string());
+                        }
+                    }
+                    self.state.save();
+                }
+
+                let loopback_text = if self.mic_loopback_active {
+                    "🔁 ON"
+                } else {
+                    "🔁 OFF"
+                };
+                if ui.selectable_label(self.mic_loopback_active, loopback_text)
+                    .on_hover_text("Mixes your real microphone into the mic channel.")
+                    .clicked()
+                {
+                    let new_state = !self.mic_loopback_active;
+                    let ok = pulse_devices::set_mic_loopback(
+                        new_state,
+                        &self.state.settings.mic_loopback_source,
+                    );
+                    if ok {
+                        self.state.settings.mic_loopback_enabled = new_state;
+                        self.state.save();
+                        self.refresh_mic_channel_status();
+                    } else {
+                        self.error_message = Some(
+                            "Couldn't toggle voice loopback.".to_string(),
+                        );
+                    }
+                }
+
+                ui.separator();
                 if ui.button("⚙ Settings").clicked() {
                     self.show_settings = !self.show_settings;
                 }
@@ -251,117 +335,10 @@ impl SoundboardApp {
 
                 let total_height = ui.available_height();
 
-                egui::TopBottomPanel::bottom("playback_panel")
-                    .resizable(true)
-                    .min_height(48.0)
-                    .default_height(total_height * 0.5)
-                    .show_inside(ui, |ui| {
-                        ui.add_space(4.0);
-                        
-                        ui.horizontal(|ui| {
-                            ui.heading("Playback");
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("⏹ Stop All").clicked() {
-                                    if let Ok(mut active) = self.audio.active_sounds.lock() {
-                                        active.clear();
-                                    }
-                                }
-
-                                let is_capturing = self.keybind_capture.as_ref()
-                                    .map(|k| k.target == KeybindTarget::StopAll)
-                                    .unwrap_or(false);
-
-                                if is_capturing {
-                                    let capture = self.keybind_capture.as_ref().unwrap();
-                                    let mut preview = String::new();
-                                    if capture.ctrl  { preview.push_str("Ctrl+"); }
-                                    if capture.alt   { preview.push_str("Alt+"); }
-                                    if capture.shift { preview.push_str("Shift+"); }
-                                    preview.push_str("...");
-
-                                    ui.colored_label(Color32::YELLOW, &preview);
-
-                                    let events = ctx.input(|i| i.events.clone());
-                                    let mods = ctx.input(|i| i.modifiers);
-
-                                    if let Some(cap) = self.keybind_capture.as_mut() {
-                                        cap.ctrl  = mods.command || mods.ctrl;
-                                        cap.alt   = mods.alt;
-                                        cap.shift = mods.shift;
-                                    }
-
-                                    for e in events {
-                                        if let egui::Event::Key { key, pressed: true, .. } = e {
-                                            if key == egui::Key::Escape {
-                                                self.keybind_capture = None;
-                                            } else {
-                                                let cap = self.keybind_capture.take().unwrap();
-                                                let mut combo = String::new();
-                                                if cap.ctrl  { combo.push_str("Ctrl+"); }
-                                                if cap.alt   { combo.push_str("Alt+"); }
-                                                if cap.shift { combo.push_str("Shift+"); }
-                                                combo.push_str(&format!("{:?}", key));
-                                                self.stop_all_hotkey = Some(combo);
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    let btn_text = match &self.stop_all_hotkey {
-                                        Some(hk) => format!("⌨ {}", hk),
-                                        None => "➕".to_string(),
-                                    };
-                                    let btn_resp = ui.small_button(&btn_text);
-                                    if btn_resp.clicked() {
-                                        let mods = ctx.input(|i| i.modifiers);
-                                        self.keybind_capture = Some(KeybindCapture {
-                                            target: KeybindTarget::StopAll,
-                                            ctrl:  mods.command || mods.ctrl,
-                                            alt:   mods.alt,
-                                            shift: mods.shift,
-                                        });
-                                    } else if btn_resp.secondary_clicked() {
-                                        self.stop_all_hotkey = None
-                                    }
-                                    btn_resp.on_hover_text("LMB to assign hotkey, RMB to remove");
-                                }
-                            });
-                        });
-                        
-                        ui.separator();
-
-                        if active_snapshot.is_empty() {
-                            ui.weak("Nothing playing");
-                        } else {
-                            let mut to_stop: Option<Uuid> = None;
-
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                for (play_id, name) in &active_snapshot {
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .add_sized(
-                                                [18.0, 18.0],
-                                                egui::Button::new("✕")
-                                                    .fill(Color32::from_rgb(160, 60, 60)),
-                                            )
-                                            .clicked()
-                                        {
-                                            to_stop = Some(*play_id);
-                                        }
-
-                                        let label = Self::truncate_name(name, 22);
-                                        ui.label(label);
-                                    });
-                                }
-                            });
-
-                            if let Some(pid) = to_stop {
-                                self.audio.stop_sound(pid);
-                            }
-                        }
-                    });
-
-                egui::CentralPanel::default().show_inside(ui, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_source("folders_scroll")
+                    .max_height(total_height * 0.5)
+                    .show(ui, |ui| {
                         let all_sounds_btn =
                             ui.selectable_label(self.state.active_folder.is_none(), "all sounds");
                         if all_sounds_btn.clicked() {
@@ -428,13 +405,145 @@ impl SoundboardApp {
                             }
                         });
                     });
+
+                ui.separator();
+
+                egui::ScrollArea::vertical().id_source("playback_scroll").show(ui, |ui| {
+                    ui.add_space(4.0);
+                    
+                    let overlap_text = if self.state.settings.allow_overlap {
+                        "🎵 Overlap: ON"
+                    } else {
+                        "🎵 Overlap: OFF"
+                    };
+                    if ui.selectable_label(self.state.settings.allow_overlap, overlap_text)
+                        .on_hover_text("ON: sounds can play on top of each other. OFF: starting a sound stops all others.")
+                        .clicked()
+                    {
+                        self.state.settings.allow_overlap = !self.state.settings.allow_overlap;
+                        self.state.save();
+                    }
+                    
+                    ui.separator();
+
+                    ui.horizontal(|ui| {
+                        ui.heading("Playback");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("⏹ Stop All").clicked() {
+                                self.audio.stop_all();
+                            }
+
+                            let is_capturing = self.keybind_capture.as_ref()
+                                .map(|k| k.target == KeybindTarget::StopAll)
+                                .unwrap_or(false);
+
+                            if is_capturing {
+                                let capture = self.keybind_capture.as_ref().unwrap();
+                                let mut preview = String::new();
+                                if capture.ctrl  { preview.push_str("Ctrl+"); }
+                                if capture.alt   { preview.push_str("Alt+"); }
+                                if capture.shift { preview.push_str("Shift+"); }
+                                preview.push_str("...");
+
+                                ui.colored_label(Color32::YELLOW, &preview);
+
+                                let events = ctx.input(|i| i.events.clone());
+                                let mods = ctx.input(|i| i.modifiers);
+
+                                if let Some(cap) = self.keybind_capture.as_mut() {
+                                    cap.ctrl  = mods.command || mods.ctrl;
+                                    cap.alt   = mods.alt;
+                                    cap.shift = mods.shift;
+                                }
+
+                                for e in events {
+                                    if let egui::Event::Key { key, pressed: true, .. } = e {
+                                        if key == egui::Key::Escape {
+                                            self.keybind_capture = None;
+                                        } else {
+                                            let cap = self.keybind_capture.take().unwrap();
+                                            let mut combo = String::new();
+                                            if cap.ctrl  { combo.push_str("Ctrl+"); }
+                                            if cap.alt   { combo.push_str("Alt+"); }
+                                            if cap.shift { combo.push_str("Shift+"); }
+                                            combo.push_str(&format!("{:?}", key));
+                                            self.stop_all_hotkey = Some(combo);
+                                        }
+                                    }
+                                }
+                            } else {
+                                let btn_text = match &self.stop_all_hotkey {
+                                    Some(hk) => format!("⌨ {}", hk),
+                                    None => "➕".to_string(),
+                                };
+                                let btn_resp = ui.small_button(&btn_text);
+                                if btn_resp.clicked() {
+                                    let mods = ctx.input(|i| i.modifiers);
+                                    self.keybind_capture = Some(KeybindCapture {
+                                        target: KeybindTarget::StopAll,
+                                        ctrl:  mods.command || mods.ctrl,
+                                        alt:   mods.alt,
+                                        shift: mods.shift,
+                                    });
+                                } else if btn_resp.secondary_clicked() {
+                                    self.stop_all_hotkey = None
+                                }
+                                btn_resp.on_hover_text("LMB to assign hotkey, RMB to remove");
+                            }
+                        });
+                    });
+                        
+                    ui.separator();
+
+                    if active_snapshot.is_empty() {
+                        ui.weak("Nothing playing");
+                    } else {
+                        let mut to_stop: Option<Uuid> = None;
+
+                        for (play_id, name) in &active_snapshot {
+                            ui.horizontal(|ui| {
+                                if ui.add_sized([18.0, 18.0], egui::Button::new("✕").fill(Color32::from_rgb(160, 60, 60))).clicked() {
+                                    to_stop = Some(*play_id);
+                                }
+                                let label = Self::truncate_name(name, 22);
+                                ui.label(label);
+                            });
+                        }
+
+                        if let Some(pid) = to_stop {
+                            self.audio.stop_sound(pid);
+                        }
+                    }
                 });
             });
 
         // ── CENTRAL PANEL: Sound Grid ────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("🔍");
+                ui.text_edit_singleline(&mut self.search_query);
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    egui::ComboBox::from_id_source("sort_order")
+                        .selected_text(match self.sort_order {
+                            SortOrder::TimeDesc => "Time (Newest)",
+                            SortOrder::TimeAsc => "Time (Oldest)",
+                            SortOrder::AlphaAsc => "A-Z",
+                            SortOrder::AlphaDesc => "Z-A",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.sort_order, SortOrder::TimeDesc, "Time (Newest)");
+                            ui.selectable_value(&mut self.sort_order, SortOrder::TimeAsc, "Time (Oldest)");
+                            ui.selectable_value(&mut self.sort_order, SortOrder::AlphaAsc, "A-Z");
+                            ui.selectable_value(&mut self.sort_order, SortOrder::AlphaDesc, "Z-A");
+                        });
+                    ui.label("Sort:");
+                });
+            });
+            ui.separator();
+
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let sound_ids_to_render: Vec<Uuid> = {
+                let mut sound_ids_to_render: Vec<Uuid> = {
                     let mut seen = std::collections::HashSet::new();
 
                     match self.state.active_folder {
@@ -460,6 +569,28 @@ impl SoundboardApp {
                             .unwrap_or_default(),
                     }
                 };
+
+                if !self.search_query.is_empty() {
+                    let q = self.search_query.to_lowercase();
+                    sound_ids_to_render.retain(|id| {
+                        self.state.sounds.get(id).map_or(false, |s| s.name.to_lowercase().contains(&q))
+                    });
+                }
+
+                sound_ids_to_render.sort_by(|a, b| {
+                    let s_a = self.state.sounds.get(a);
+                    let s_b = self.state.sounds.get(b);
+                    if let (Some(sa), Some(sb)) = (s_a, s_b) {
+                        match self.sort_order {
+                            SortOrder::TimeAsc => sa.time_added.cmp(&sb.time_added),
+                            SortOrder::TimeDesc => sb.time_added.cmp(&sa.time_added),
+                            SortOrder::AlphaAsc => sa.name.to_lowercase().cmp(&sb.name.to_lowercase()),
+                            SortOrder::AlphaDesc => sb.name.to_lowercase().cmp(&sa.name.to_lowercase()),
+                        }
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                });
 
                 let cell_width = 310.0;
                 let available_width = ui.available_width().max(cell_width);
@@ -492,6 +623,7 @@ impl SoundboardApp {
         // ── GENERAL SETTINGS WINDOW ──────────────────────────────────────────
         if self.show_settings {
             let mut want_refresh_devices = false;
+            let mut want_refresh_mic_status = false;
 
             egui::Window::new("General Settings")
                 .open(&mut self.show_settings)
@@ -504,48 +636,59 @@ impl SoundboardApp {
 
                     match self.active_settings_tab {
                         0 => {
-                            ui.label("Audio-devices");
+                            ui.label("Audio devices");
 
                             if ui.button("🔄 Update device list").clicked() {
                                 want_refresh_devices = true;
                             }
 
                             ui.separator();
-                            ui.label("Output (Headphones):");
-                            ui.horizontal(|ui| {
-                                ui.label("Show:");
-                                egui::ComboBox::from_id_source("output_filter")
-                                    .selected_text(self.output_filter.label())
-                                    .show_ui(ui, |ui| {
-                                        for f in DeviceFilter::ALL_OUTPUT {
-                                            ui.selectable_value(&mut self.output_filter, f, f.label());
-                                        }
-                                    });
-                            });
-                            ui.label(format!(
-                                    "Current output: {}",
-                                    Self::device_label(&self.output_devices, &self.state.settings.default_output)
-                            ));
+                            ui.label("Local sound — only you hear this (headphones/speakers):");
+                            
+                            let mut out_changed = false;
+                            let out_label = Self::device_label(&self.output_devices, &self.state.settings.default_output).to_string();
+                            egui::ComboBox::from_id_source("def_out_settings")
+                                .selected_text(out_label)
+                                .show_ui(ui, |ui| {
+                                    out_changed |= ui.selectable_value(
+                                        &mut self.state.settings.default_output,
+                                        crate::audio::DEFAULT_DEVICE.to_string(),
+                                        "Default",
+                                    ).changed();
+                                    for dev in self.output_devices.iter() {
+                                        out_changed |= ui.selectable_value(
+                                            &mut self.state.settings.default_output,
+                                            dev.name.clone(),
+                                            &dev.description,
+                                        ).changed();
+                                    }
+                                });
+                            if out_changed {
+                                self.state.save();
+                            }
 
                             ui.separator();
-                            ui.label("Input (Microphone):");
+                            ui.heading("Mic channel — what others hear");
+                            ui.label(
+                                "Nisound keeps its own virtual sink+microphone running \
+                                 automatically while the app is open, so soundboard sounds can \
+                                 reach Discord/Zoom/OBS. Pick \"Nisound_Mic\" as your microphone \
+                                 there once."
+                            );
+
+                            let status_text = if self.mic_channel_exists {
+                                "✔ Nisound_Mic is active"
+                            } else {
+                                "✘ Not active (will be created automatically)"
+                            };
                             ui.horizontal(|ui| {
-                                ui.label("Show:");
-                                egui::ComboBox::from_id_source("input_filter")
-                                    .selected_text(self.input_filter.label())
-                                    .show_ui(ui, |ui| {
-                                        for f in DeviceFilter::ALL_INPUT {
-                                            ui.selectable_value(&mut self.input_filter, f, f.label());
-                                        }
-                                    });
+                                ui.label(status_text);
+                                if ui.small_button("🔄").on_hover_text("Refresh status").clicked() {
+                                    want_refresh_mic_status = true;
+                                }
                             });
-                            ui.label(format!(
-                                    "Current input: {}",
-                                    Self::device_label(&self.input_devices, &self.state.settings.default_input)
-                            ));
                         }
                         1 => {
-                            // ── без змін: Theme Color Editor лишається як був ──
                             ui.label("Theme Color Editor");
                             let mut changed = false;
                             for (key, color) in self.state.settings.colors.iter_mut() {
@@ -565,8 +708,10 @@ impl SoundboardApp {
             if want_refresh_devices {
                 self.refresh_devices();
             }
+            if want_refresh_mic_status {
+                self.refresh_mic_channel_status();
+            }
         }
-
 
         self.render_folder_import_prompt(ctx);
         self.render_sound_popup(ctx);
@@ -880,11 +1025,11 @@ impl SoundboardApp {
                                     });
                                     ui.end_row();
 
-                                    ui.strong("Volume (HP):");
+                                    ui.strong("Volume (Local):");
                                     changed |= ui
                                         .add(
                                             egui::Slider::new(&mut sound.volume_playback, 0.0..=1.0)
-                                                .text("headphones"),
+                                                .text("local sound"),
                                         )
                                         .changed();
                                     ui.end_row();
@@ -893,12 +1038,12 @@ impl SoundboardApp {
                                     changed |= ui
                                         .add(
                                             egui::Slider::new(&mut sound.volume_out, 0.0..=1.0)
-                                                .text("virtual mic"),
+                                                .text("mic channel"),
                                         )
                                         .changed();
                                     ui.end_row();
 
-                                    ui.strong("Headphones:");
+                                    ui.strong("Local sound:");
                                     changed |= ui.checkbox(&mut sound.headphones_enabled, "enabled").changed();
                                     ui.end_row();
 
@@ -910,7 +1055,7 @@ impl SoundboardApp {
                                     match &sound.custom_channels {
                                         Some(ch) => {
                                             ui.vertical(|ui| {
-                                                ui.label(format!("In: {}", ch.input_device));
+                                                ui.label(format!("Mic: {}", ch.mic_sink));
                                                 ui.label(format!("Out: {}", ch.output_device));
                                             });
                                         }
@@ -977,20 +1122,36 @@ impl SoundboardApp {
                 continue;
             }
 
-            let is_duplicate = self.state.sounds.values().any(|s| s.path == path);
-            if is_duplicate {
-                skipped += 1;
-                continue;
-            }
+            // Шукаємо, чи цей файл уже імпортований раніше
+            let existing_id = self.state.sounds.iter()
+                .find(|(_, s)| s.path == path)
+                .map(|(id, _)| *id);
 
-            let id = Uuid::new_v4();
-            let entry = Self::make_sound_entry(id, path);
-            self.state.sounds.insert(id, entry);
+            match existing_id {
+                Some(id) => {
+                    if let Some(folder_id) = target_folder {
+                        if let Some(folder) = self.state.folders.iter_mut().find(|f| f.id == folder_id) {
+                            if !folder.sound_ids.contains(&id) {
+                                folder.sound_ids.push(id);
+                            } else {
+                                skipped += 1;
+                            }
+                        }
+                    } else {
+                        skipped += 1;
+                    }
+                }
+                None => {
+                    let id = Uuid::new_v4();
+                    let entry = Self::make_sound_entry(id, path);
+                    self.state.sounds.insert(id, entry);
 
-            if let Some(folder_id) = target_folder {
-                if let Some(folder) = self.state.folders.iter_mut().find(|f| f.id == folder_id) {
-                    if !folder.sound_ids.contains(&id) {
-                        folder.sound_ids.push(id);
+                    if let Some(folder_id) = target_folder {
+                        if let Some(folder) = self.state.folders.iter_mut().find(|f| f.id == folder_id) {
+                            if !folder.sound_ids.contains(&id) {
+                                folder.sound_ids.push(id);
+                            }
+                        }
                     }
                 }
             }
@@ -998,7 +1159,7 @@ impl SoundboardApp {
 
         if skipped > 0 {
             self.error_message = Some(format!(
-                "Skipped {} sound(s) that were already added.",
+                "Skipped {} sound(s) that were already added to this scope.",
                 skipped
             ));
         }
@@ -1023,6 +1184,10 @@ impl SoundboardApp {
             mic_enabled: true,
             headphones_enabled: true,
             custom_channels: None,
+            time_added: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
             exists: true,
         }
     }
@@ -1149,7 +1314,8 @@ impl SoundboardApp {
                                                         sound.headphones_enabled,
                                                         sound.mic_enabled,
                                                         &self.state.settings.default_output,
-                                                        &self.state.settings.default_input,
+                                                        &self.state.settings.mic_sink,
+                                                        self.state.settings.allow_overlap,
                                                     );
                                                 }
                                             }
@@ -1159,23 +1325,6 @@ impl SoundboardApp {
                                 resp
                             })
                             .inner;
-
-                        play_resp.context_menu(|ui| {
-                            ui.label("Playback Vol (Headphones):");
-                            if ui
-                                .add(egui::Slider::new(&mut sound.volume_playback, 0.0..=1.0))
-                                .changed()
-                            {
-                                self.state.save();
-                            }
-                            ui.label("Output Vol (Virtual Mic):");
-                            if ui
-                                .add(egui::Slider::new(&mut sound.volume_out, 0.0..=1.0))
-                                .changed()
-                            {
-                                self.state.save();
-                            }
-                        });
 
                         ui.separator();
 
@@ -1316,51 +1465,6 @@ impl SoundboardApp {
                             })
                             .inner;
 
-                        info_resp.context_menu(|ui| {
-                            if sound.hotkey.is_some() {
-                                if ui.button("Clear Shortcut").clicked() {
-                                    sound.hotkey = None;
-                                    self.state.save();
-                                    ui.close_menu();
-                                }
-                            } else {
-                                ui.weak("No shortcut assigned");
-                            }
-                            
-                            ui.separator();
-                            if self.state.active_folder.is_some() {
-                                if ui.button("Remove from folder").clicked() {
-                                    if self.selected_sounds.contains(&sound.id) {
-                                        self.action_remove_sounds_from_folder =
-                                            self.selected_sounds.iter().cloned().collect();
-                                    } else {
-                                        self.action_remove_sounds_from_folder = vec![sound.id];
-                                    }
-                                    ui.close_menu();
-                                }
-                            }
-                            if ui.button("Delete (from all sounds)").clicked() {
-                                let ids = if self.selected_sounds.contains(&sound.id) {
-                                    self.selected_sounds.iter().cloned().collect()
-                                } else {
-                                    vec![sound.id]
-                                };
-                                self.confirm_action = Some(PendingAction::DeleteSound(ids));
-                                ui.close_menu();
-                            }
-                            ui.separator();
-                            if ui.button("Settings").clicked() {
-                                self.active_sound_popup = Some(sound.id);
-                                self.active_sound_popup_tab = 0;
-                                ui.close_menu();
-                            }
-                            if ui.button("Edit").clicked() {
-                                self.active_sound_popup = Some(sound.id);
-                                self.active_sound_popup_tab = 1;
-                                ui.close_menu();
-                            }
-                        });
-
                         ui.separator();
 
                         // ── CHANNELS SECTION ──────────────────────────────────
@@ -1397,7 +1501,8 @@ impl SoundboardApp {
                                                         false,
                                                         true,
                                                         &self.state.settings.default_output,
-                                                        &self.state.settings.default_input,
+                                                        &self.state.settings.mic_sink,
+                                                        self.state.settings.allow_overlap,
                                                     );
                                                 }
                                             }
@@ -1405,7 +1510,7 @@ impl SoundboardApp {
                                             if ui
                                                 .add_sized(
                                                     [56.0, 20.0],
-                                                    egui::Button::new("🎧 HP"),
+                                                    egui::Button::new("🎧 Local"),
                                                 )
                                                 .clicked()
                                             {
@@ -1423,7 +1528,8 @@ impl SoundboardApp {
                                                         true,
                                                         false,
                                                         &self.state.settings.default_output,
-                                                        &self.state.settings.default_input,
+                                                        &self.state.settings.mic_sink,
+                                                        self.state.settings.allow_overlap,
                                                     );
                                                 }
                                             }
@@ -1434,24 +1540,76 @@ impl SoundboardApp {
                             })
                             .inner;
 
-                        channels_resp.context_menu(|ui| {
-                            ui.label("Channel routing");
+                        // ── ОБ'ЄДНАНЕ КОНТЕКСТНЕ МЕНЮ (СПІЛЬНИЙ ХІТБОКС) ───
+                        let menu_content = |ui: &mut egui::Ui, app: &mut Self, s: &mut SoundEntry| {
+                            // 1. Shortcut
+                            ui.label("Shortcut:");
+                            if s.hotkey.is_some() {
+                                if ui.button("Clear Shortcut").clicked() {
+                                    s.hotkey = None;
+                                    app.state.save();
+                                    ui.close_menu();
+                                }
+                            } else {
+                                ui.weak("No shortcut assigned");
+                            }
                             ui.separator();
-                            ui.label("Output channel:");
-                            if ui.button("Default").clicked() {
-                                sound.custom_channels = None;
-                                self.state.save();
+
+                            // 2. Delete / Remove from folder
+                            if app.state.active_folder.is_some() {
+                                if ui.button("Remove from folder").clicked() {
+                                    if app.selected_sounds.contains(&s.id) {
+                                        app.action_remove_sounds_from_folder =
+                                            app.selected_sounds.iter().cloned().collect();
+                                    } else {
+                                        app.action_remove_sounds_from_folder = vec![s.id];
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+
+                            if ui.button("Delete (from all sounds)").clicked() {
+                                let ids = if app.selected_sounds.contains(&s.id) {
+                                    app.selected_sounds.iter().cloned().collect()
+                                } else {
+                                    vec![s.id]
+                                };
+                                app.confirm_action = Some(PendingAction::DeleteSound(ids));
                                 ui.close_menu();
                             }
                             ui.separator();
-                            ui.label("Input channel:");
-                            if ui.button("Default").clicked() {
-                                sound.custom_channels = None;
-                                self.state.save();
+
+                            // 3. Volume
+                            ui.label("Volume (Local sound):");
+                            if ui.add(egui::Slider::new(&mut s.volume_playback, 0.0..=1.0)).changed() {
+                                app.state.save();
+                            }
+                            ui.label("Volume (Mic channel):");
+                            if ui.add(egui::Slider::new(&mut s.volume_out, 0.0..=1.0)).changed() {
+                                app.state.save();
+                            }
+                            ui.separator();
+
+                            // 4. Settings
+                            if ui.button("Settings").clicked() {
+                                app.active_sound_popup = Some(s.id);
+                                app.active_sound_popup_tab = 0;
                                 ui.close_menu();
                             }
-                            ui.label("Custom routing is not implemented yet.");
-                        });
+
+                            // 5. Edit
+                            if ui.button("Edit").clicked() {
+                                app.active_sound_popup = Some(s.id);
+                                app.active_sound_popup_tab = 1;
+                                ui.close_menu();
+                            }
+                        };
+
+                        // Зв'язуємо однакове меню з усіма респонсами для уникнення "мертвих зон"
+                        bg_resp.context_menu(|ui| menu_content(ui, self, sound));
+                        play_resp.context_menu(|ui| menu_content(ui, self, sound));
+                        info_resp.context_menu(|ui| menu_content(ui, self, sound));
+                        channels_resp.context_menu(|ui| menu_content(ui, self, sound));
 
                         // ── SELECTION LOGIC ───────────────────────────────────
                         let ctrl = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
@@ -1520,9 +1678,7 @@ impl eframe::App for SoundboardApp {
                 
                 if let Some(hk) = &self.stop_all_hotkey {
                     if hk == &key_str || hk.ends_with(&format!("+{}", key_str)) {
-                        if let Ok(mut active) = self.audio.active_sounds.lock() {
-                            active.clear();
-                        }
+                        self.audio.stop_all();
                         stopped_all = true;
                     }
                 }
@@ -1547,7 +1703,8 @@ impl eframe::App for SoundboardApp {
                         sound.headphones_enabled,
                         sound.mic_enabled,
                         &self.state.settings.default_output,
-                        &self.state.settings.default_input,
+                        &self.state.settings.mic_sink,
+                        self.state.settings.allow_overlap,
                     );
                 }
             }
@@ -1556,5 +1713,8 @@ impl eframe::App for SoundboardApp {
         ctx.request_repaint();
         self.render_ui(ctx);
     }
-}
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown();
+    }
+}

@@ -14,13 +14,19 @@ pub struct SoundEntry {
     pub mic_enabled: bool,
     pub headphones_enabled: bool,
     pub custom_channels: Option<CustomChannels>,
+    #[serde(default)]
+    pub time_added: u64,
     #[serde(skip)]
     pub exists: bool,
 }
 
+/// Per-sound override of the global routing. Both fields are technical
+/// Pulse *sink* names (playback always targets a sink, never a source) —
+/// `mic_sink` is the sink that feeds the virtual/"mic" channel, the same
+/// way `output_device` feeds the headphones/speakers channel.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CustomChannels {
-    pub input_device: String,
+    pub mic_sink: String,
     pub output_device: String,
 }
 
@@ -33,8 +39,21 @@ pub struct Folder {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AppSettings {
+    /// Technical Pulse sink name for the "headphones/speakers" channel.
     pub default_output: String,
-    pub default_input: String,
+    /// Technical Pulse sink name for the "microphone" channel — this is a
+    /// sink too (e.g. the Nisound-managed virtual sink), never a source.
+    pub mic_sink: String,
+    /// If false, starting a new sound stops every currently playing sound
+    /// first (both channels). If true, sounds overlap freely.
+    pub allow_overlap: bool,
+    /// Whether Nisound should keep a `module-loopback` running from
+    /// `mic_loopback_source` into `mic_sink`, so the user's real voice and
+    /// the soundboard effects end up mixed together for listeners.
+    pub mic_loopback_enabled: bool,
+    /// Technical Pulse *source* name of the real microphone to loop into
+    /// `mic_sink` when `mic_loopback_enabled` is true.
+    pub mic_loopback_source: String,
     pub colors: HashMap<String, [u8; 3]>,
 }
 
@@ -58,7 +77,10 @@ impl AppState {
             active_folder: None,
             settings: AppSettings {
                 default_output: "Default".to_string(),
-                default_input: "Default".to_string(),
+                mic_sink: "Default".to_string(),
+                allow_overlap: true,
+                mic_loopback_enabled: false,
+                mic_loopback_source: "Default".to_string(),
                 colors,
             },
         }

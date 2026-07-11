@@ -1,5 +1,9 @@
-use libpulse_binding::sample::{Format, Spec};
-use libpulse_binding::stream::Direction;
+use libpulse_binding as pulse;
+use pulse::context::{Context, FlagSet as ContextFlagSet};
+use pulse::mainloop::standard::{IterateResult, Mainloop};
+use pulse::proplist::Proplist;
+use pulse::sample::{Format, Spec};
+use pulse::stream::Direction;
 use libpulse_simple_binding::Simple;
 use rodio::{Decoder, Source};
 use std::fs::File;
@@ -9,11 +13,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-/// A single output stream feeding one PulseAudio sink or source (monitor).
-/// Replaces the old rodio::Sink — same "fire and forget + poll" API
-/// (`stop()` / `empty()`), but writes PCM straight to Pulse/PipeWire so it
-/// can target any named device (e.g. "alsa_output.pci-..." or a virtual
-/// mic sink), not just what cpal happens to enumerate on the ALSA host.
+/// A single output stream feeding one PulseAudio sink.
+/// `stop()` / `empty()` mirror the old rodio::Sink API, but PCM is written
+/// straight to Pulse/PipeWire so it can target any named sink (headphones,
+/// speakers, or the Nisound virtual mic sink), with an explicit
+/// move-sink-input right after connecting (see `move_stream_to_sink`).
 pub struct PulseSink {
     stop_flag: Arc<AtomicBool>,
     finished_flag: Arc<AtomicBool>,
@@ -46,9 +50,9 @@ pub struct AudioEngine {
     pub active_sounds: Arc<Mutex<Vec<ActiveSound>>>,
 }
 
-/// Sentinel value meaning "let PulseAudio/PipeWire pick the default
-/// device", used both as the initial config value and as a synthetic
-/// entry the UI prepends to the device list.
+/// Sentinel value meaning "let PulseAudio/PipeWire pick the default sink",
+/// used both as the initial config value and as a synthetic entry the UI
+/// prepends to the device list.
 pub const DEFAULT_DEVICE: &str = "Default";
 
 impl AudioEngine {
@@ -58,6 +62,20 @@ impl AudioEngine {
         }
     }
 
+    /// Stops every currently playing sound on every channel. Used both by
+    /// the "Stop All" button and, when `allow_overlap` is false, right
+    /// before starting a new sound.
+    pub fn stop_all(&self) {
+        if let Ok(mut active) = self.active_sounds.lock() {
+            for sound in active.drain(..) {
+                for sink in sound.sinks {
+                    sink.stop();
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn play_sound(
         &self,
         sound_id: Uuid,
@@ -68,10 +86,15 @@ impl AudioEngine {
         headphones: bool,
         mic: bool,
         default_headphone_device: &str,
-        default_mic_device: &str,
+        default_mic_sink: &str,
+        allow_overlap: bool,
     ) {
         if !path.exists() {
             return;
+        }
+
+        if !allow_overlap {
+            self.stop_all();
         }
 
         let play_id = Uuid::new_v4();
@@ -84,7 +107,7 @@ impl AudioEngine {
         }
 
         if mic {
-            if let Some(sink) = self.spawn_sink(path, volume_out, default_mic_device) {
+            if let Some(sink) = self.spawn_sink(path, volume_out, default_mic_sink) {
                 sinks.push(sink);
             }
         }
@@ -102,9 +125,9 @@ impl AudioEngine {
     }
 
     /// Opens a fresh Pulse/PipeWire playback stream targeting `device_name`
-    /// (a technical Pulse name like "alsa_output.pci-0000_00_1f.3.analog-stereo",
-    /// or DEFAULT_DEVICE to let the server pick), decodes `path` with rodio,
-    /// and streams PCM into it on a background thread.
+    /// (a technical Pulse sink name, or DEFAULT_DEVICE), decodes `path` with
+    /// rodio, explicitly moves the resulting stream onto that sink, then
+    /// streams PCM into it on a background thread.
     fn spawn_sink(&self, path: &Path, volume: f32, device_name: &str) -> Option<PulseSink> {
         let file = File::open(path).ok()?;
         let decoder = Decoder::new(BufReader::new(file)).ok()?;
@@ -121,23 +144,41 @@ impl AudioEngine {
             return None;
         }
 
-        let device = if device_name.is_empty() || device_name == DEFAULT_DEVICE {
+        let target_sink: Option<String> = if device_name.is_empty() || device_name == DEFAULT_DEVICE
+        {
             None
         } else {
-            Some(device_name)
+            Some(device_name.to_string())
         };
+
+        // Unique per-stream name so we can find *this* sink-input on the
+        // server afterwards (needed to move it explicitly).
+        let stream_name = format!("nisound-{}", Uuid::new_v4());
 
         let simple = Simple::new(
             None, // default server (works for both PulseAudio and pipewire-pulse)
             "Nisound",
             Direction::Playback,
-            device,
-            "sound effect",
+            target_sink.as_deref(),
+            &stream_name,
             &spec,
             None,
             None,
         )
         .ok()?;
+
+        if let Some(sink_name) = &target_sink {
+            // Under pipewire-pulse, the sink-input sometimes isn't visible
+            // via introspection until the stream has actually written some
+            // data (connect_playback alone isn't always enough). Prime it
+            // with a short burst of silence first, then move.
+            let priming_ms = 50u32;
+            let priming_frames = (sample_rate * priming_ms / 1000) as usize;
+            let silence = vec![0u8; priming_frames * channels as usize * 2];
+            let _ = simple.write(&silence);
+
+            move_stream_to_sink(&stream_name, sink_name);
+        }
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let finished_flag = Arc::new(AtomicBool::new(false));
@@ -206,4 +247,98 @@ impl AudioEngine {
             active.retain(|s| s.sinks.iter().any(|sink| !sink.empty()));
         }
     }
+}
+
+/// Opens a short-lived, separate connection to the Pulse/PipeWire server,
+/// finds the sink-input whose stream name is `stream_name`, and issues a
+/// `move-sink-input` to `sink_name`. Blocks (briefly) until done.
+fn move_stream_to_sink(stream_name: &str, sink_name: &str) {
+    let mut proplist = match Proplist::new() {
+        Some(p) => p,
+        None => return,
+    };
+    let _ = proplist.set_str(pulse::proplist::properties::APPLICATION_NAME, "Nisound");
+
+    let mut mainloop = match Mainloop::new() {
+        Some(m) => m,
+        None => return,
+    };
+
+    let context = match Context::new_with_proplist(&mainloop, "NisoundMoveStream", &proplist) {
+        Some(c) => std::cell::RefCell::new(c),
+        None => return,
+    };
+
+    if context
+        .borrow_mut()
+        .connect(None, ContextFlagSet::NOFLAGS, None)
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        match mainloop.iterate(true) {
+            IterateResult::Quit(_) | IterateResult::Err(_) => return,
+            IterateResult::Success(_) => {}
+        }
+        match context.borrow().get_state() {
+            pulse::context::State::Ready => break,
+            pulse::context::State::Failed | pulse::context::State::Terminated => return,
+            _ => {}
+        }
+    }
+
+    let found_index: std::rc::Rc<std::cell::RefCell<Option<u32>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let done: std::rc::Rc<std::cell::RefCell<bool>> = std::rc::Rc::new(std::cell::RefCell::new(false));
+
+    let found_for_cb = found_index.clone();
+    let done_for_cb = done.clone();
+    let target_name = stream_name.to_string();
+    let op = context
+        .borrow()
+        .introspect()
+        .get_sink_input_info_list(move |res| {
+            if let pulse::callbacks::ListResult::Item(info) = res {
+                let name = info.name.as_ref().map(|c| c.to_string()).unwrap_or_default();
+                if name == target_name {
+                    *found_for_cb.borrow_mut() = Some(info.index);
+                }
+            } else if matches!(res, pulse::callbacks::ListResult::End) {
+                *done_for_cb.borrow_mut() = true;
+            }
+        });
+    while !*done.borrow() {
+        mainloop.iterate(true);
+    }
+    drop(op);
+
+    let index = match *found_index.borrow() {
+        Some(i) => i,
+        None => {
+            context.borrow_mut().disconnect();
+            return;
+        }
+    };
+
+    let move_done: std::rc::Rc<std::cell::RefCell<bool>> =
+        std::rc::Rc::new(std::cell::RefCell::new(false));
+    let move_done_cb = move_done.clone();
+    let op = {
+        let mut introspector = context.borrow().introspect();
+        introspector.move_sink_input_by_name(
+            index,
+            sink_name,
+            Some(Box::new(move |_success| {
+                *move_done_cb.borrow_mut() = true;
+            })),
+        )
+    };
+    while !*move_done.borrow() {
+        mainloop.iterate(true);
+    }
+    drop(op);
+
+    context.borrow_mut().disconnect();
 }
