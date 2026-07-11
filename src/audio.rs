@@ -9,18 +9,16 @@ use rodio::{Decoder, Source};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 /// A single output stream feeding one PulseAudio sink.
-/// `stop()` / `empty()` mirror the old rodio::Sink API, but PCM is written
-/// straight to Pulse/PipeWire so it can target any named sink (headphones,
-/// speakers, or the Nisound virtual mic sink), with an explicit
-/// move-sink-input right after connecting (see `move_stream_to_sink`).
 pub struct PulseSink {
     stop_flag: Arc<AtomicBool>,
     finished_flag: Arc<AtomicBool>,
+    pub volume: Arc<AtomicU32>,
+    pub is_mic: bool,
 }
 
 impl PulseSink {
@@ -50,9 +48,6 @@ pub struct AudioEngine {
     pub active_sounds: Arc<Mutex<Vec<ActiveSound>>>,
 }
 
-/// Sentinel value meaning "let PulseAudio/PipeWire pick the default sink",
-/// used both as the initial config value and as a synthetic entry the UI
-/// prepends to the device list.
 pub const DEFAULT_DEVICE: &str = "Default";
 
 impl AudioEngine {
@@ -62,14 +57,22 @@ impl AudioEngine {
         }
     }
 
-    /// Stops every currently playing sound on every channel. Used both by
-    /// the "Stop All" button and, when `allow_overlap` is false, right
-    /// before starting a new sound.
     pub fn stop_all(&self) {
         if let Ok(mut active) = self.active_sounds.lock() {
             for sound in active.drain(..) {
                 for sink in sound.sinks {
                     sink.stop();
+                }
+            }
+        }
+    }
+
+    pub fn update_live_volume(&self, sound_id: Uuid, local_vol: f32, mic_vol: f32) {
+        if let Ok(active) = self.active_sounds.lock() {
+            for s in active.iter().filter(|s| s.sound_id == sound_id) {
+                for sink in &s.sinks {
+                    let v = if sink.is_mic { mic_vol } else { local_vol };
+                    sink.volume.store(v.to_bits(), Ordering::Relaxed);
                 }
             }
         }
@@ -101,13 +104,13 @@ impl AudioEngine {
         let mut sinks = Vec::new();
 
         if headphones {
-            if let Some(sink) = self.spawn_sink(path, volume_playback, default_headphone_device) {
+            if let Some(sink) = self.spawn_sink(path, volume_playback, default_headphone_device, false) {
                 sinks.push(sink);
             }
         }
 
         if mic {
-            if let Some(sink) = self.spawn_sink(path, volume_out, default_mic_sink) {
+            if let Some(sink) = self.spawn_sink(path, volume_out, default_mic_sink, true) {
                 sinks.push(sink);
             }
         }
@@ -124,11 +127,7 @@ impl AudioEngine {
         }
     }
 
-    /// Opens a fresh Pulse/PipeWire playback stream targeting `device_name`
-    /// (a technical Pulse sink name, or DEFAULT_DEVICE), decodes `path` with
-    /// rodio, explicitly moves the resulting stream onto that sink, then
-    /// streams PCM into it on a background thread.
-    fn spawn_sink(&self, path: &Path, volume: f32, device_name: &str) -> Option<PulseSink> {
+    fn spawn_sink(&self, path: &Path, initial_volume: f32, device_name: &str, is_mic: bool) -> Option<PulseSink> {
         let file = File::open(path).ok()?;
         let decoder = Decoder::new(BufReader::new(file)).ok()?;
 
@@ -151,12 +150,10 @@ impl AudioEngine {
             Some(device_name.to_string())
         };
 
-        // Unique per-stream name so we can find *this* sink-input on the
-        // server afterwards (needed to move it explicitly).
         let stream_name = format!("nisound-{}", Uuid::new_v4());
 
         let simple = Simple::new(
-            None, // default server (works for both PulseAudio and pipewire-pulse)
+            None,
             "Nisound",
             Direction::Playback,
             target_sink.as_deref(),
@@ -168,10 +165,6 @@ impl AudioEngine {
         .ok()?;
 
         if let Some(sink_name) = &target_sink {
-            // Under pipewire-pulse, the sink-input sometimes isn't visible
-            // via introspection until the stream has actually written some
-            // data (connect_playback alone isn't always enough). Prime it
-            // with a short burst of silence first, then move.
             let priming_ms = 50u32;
             let priming_frames = (sample_rate * priming_ms / 1000) as usize;
             let silence = vec![0u8; priming_frames * channels as usize * 2];
@@ -182,9 +175,11 @@ impl AudioEngine {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let finished_flag = Arc::new(AtomicBool::new(false));
+        let volume_atomic = Arc::new(AtomicU32::new(initial_volume.to_bits()));
+
         let thread_stop = stop_flag.clone();
         let thread_finished = finished_flag.clone();
-        let volume = volume.clamp(0.0, 2.0);
+        let thread_volume = volume_atomic.clone();
 
         std::thread::spawn(move || {
             const CHUNK_FRAMES: usize = 1024;
@@ -194,10 +189,12 @@ impl AudioEngine {
 
             'outer: loop {
                 byte_buf.clear();
+                let current_vol = f32::from_bits(thread_volume.load(Ordering::Relaxed)).clamp(0.0, 2.0);
+                
                 for _ in 0..chunk_samples {
                     match decoder.next() {
                         Some(sample) => {
-                            let scaled = (sample as f32 * volume)
+                            let scaled = (sample as f32 * current_vol)
                                 .clamp(i16::MIN as f32, i16::MAX as f32)
                                 as i16;
                             byte_buf.extend_from_slice(&scaled.to_ne_bytes());
@@ -228,6 +225,8 @@ impl AudioEngine {
         Some(PulseSink {
             stop_flag,
             finished_flag,
+            volume: volume_atomic,
+            is_mic,
         })
     }
 
@@ -249,9 +248,6 @@ impl AudioEngine {
     }
 }
 
-/// Opens a short-lived, separate connection to the Pulse/PipeWire server,
-/// finds the sink-input whose stream name is `stream_name`, and issues a
-/// `move-sink-input` to `sink_name`. Blocks (briefly) until done.
 fn move_stream_to_sink(stream_name: &str, sink_name: &str) {
     let mut proplist = match Proplist::new() {
         Some(p) => p,

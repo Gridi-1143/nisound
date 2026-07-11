@@ -168,6 +168,14 @@ impl SoundboardApp {
         self.state.save();
     }
 
+    fn get_effective_volume(&self, sound: &SoundEntry) -> (f32, f32) {
+        if sound.use_global_volume {
+            (self.state.settings.global_volume_playback, self.state.settings.global_volume_out)
+        } else {
+            (sound.volume_playback, sound.volume_out)
+        }
+    }
+
     pub fn render_ui(&mut self, ctx: &Context) {
         self.audio.clean_dead_sinks();
 
@@ -175,12 +183,13 @@ impl SoundboardApp {
         if ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some(sound_id) = self.last_selected_sound {
                 if let Some(sound) = self.state.sounds.get(&sound_id).cloned() {
+                    let (v_local, v_mic) = self.get_effective_volume(&sound);
                     self.audio.play_sound(
                         sound.id,
                         &sound.name,
                         &sound.path,
-                        sound.volume_playback,
-                        sound.volume_out,
+                        v_local,
+                        v_mic,
                         sound.headphones_enabled,
                         sound.mic_enabled,
                         &self.state.settings.default_output,
@@ -222,6 +231,11 @@ impl SoundboardApp {
                 }
 
                 ui.separator();
+
+                if ui.button("🔄").on_hover_text("Refresh device list").clicked() {
+                    self.refresh_devices();
+                    self.refresh_mic_channel_status();
+                }
 
                 ui.label("To others (mic):");
                 let mut mic_changed = false;
@@ -312,6 +326,24 @@ impl SoundboardApp {
                         self.error_message = Some(
                             "Couldn't toggle voice loopback.".to_string(),
                         );
+                    }
+                }
+
+                ui.separator();
+                
+                ui.label("Global Vol:");
+                let mut global_vol_changed = false;
+                ui.label("🎧");
+                global_vol_changed |= ui.add_sized([50.0, 16.0], egui::Slider::new(&mut self.state.settings.global_volume_playback, 0.0..=1.0).show_value(false)).changed();
+                ui.label("🎙");
+                global_vol_changed |= ui.add_sized([50.0, 16.0], egui::Slider::new(&mut self.state.settings.global_volume_out, 0.0..=1.0).show_value(false)).changed();
+
+                if global_vol_changed {
+                    self.state.save();
+                    for (id, s) in &self.state.sounds {
+                        if s.use_global_volume {
+                            self.audio.update_live_volume(*id, self.state.settings.global_volume_playback, self.state.settings.global_volume_out);
+                        }
                     }
                 }
 
@@ -903,7 +935,6 @@ impl SoundboardApp {
         }
     }
 
-    // ── SOUND SETTINGS POPUP ─────────────────────────────────────────────────
     fn render_sound_popup(&mut self, ctx: &Context) {
         let Some(sound_id) = self.active_sound_popup else {
             return;
@@ -1025,23 +1056,28 @@ impl SoundboardApp {
                                     });
                                     ui.end_row();
 
+                                    ui.strong("Volume Settings:");
+                                    let mut vol_changed = ui.checkbox(&mut sound.use_global_volume, "Use default volume").changed();
+                                    ui.end_row();
+
                                     ui.strong("Volume (Local):");
-                                    changed |= ui
-                                        .add(
-                                            egui::Slider::new(&mut sound.volume_playback, 0.0..=1.0)
-                                                .text("local sound"),
-                                        )
-                                        .changed();
+                                    ui.add_enabled_ui(!sound.use_global_volume, |ui| {
+                                        vol_changed |= ui.add(egui::Slider::new(&mut sound.volume_playback, 0.0..=1.0).text("local sound")).changed();
+                                    });
                                     ui.end_row();
 
                                     ui.strong("Volume (Mic):");
-                                    changed |= ui
-                                        .add(
-                                            egui::Slider::new(&mut sound.volume_out, 0.0..=1.0)
-                                                .text("mic channel"),
-                                        )
-                                        .changed();
+                                    ui.add_enabled_ui(!sound.use_global_volume, |ui| {
+                                        vol_changed |= ui.add(egui::Slider::new(&mut sound.volume_out, 0.0..=1.0).text("mic channel")).changed();
+                                    });
                                     ui.end_row();
+
+                                    if vol_changed {
+                                        changed = true;
+                                        let v_local = if sound.use_global_volume { self.state.settings.global_volume_playback } else { sound.volume_playback };
+                                        let v_mic = if sound.use_global_volume { self.state.settings.global_volume_out } else { sound.volume_out };
+                                        self.audio.update_live_volume(sound_id, v_local, v_mic);
+                                    }
 
                                     ui.strong("Local sound:");
                                     changed |= ui.checkbox(&mut sound.headphones_enabled, "enabled").changed();
@@ -1122,7 +1158,6 @@ impl SoundboardApp {
                 continue;
             }
 
-            // Шукаємо, чи цей файл уже імпортований раніше
             let existing_id = self.state.sounds.iter()
                 .find(|(_, s)| s.path == path)
                 .map(|(id, _)| *id);
@@ -1181,6 +1216,7 @@ impl SoundboardApp {
             hotkey: None,
             volume_out: 1.0,
             volume_playback: 1.0,
+            use_global_volume: true,
             mic_enabled: true,
             headphones_enabled: true,
             custom_channels: None,
@@ -1305,12 +1341,13 @@ impl SoundboardApp {
                                                 });
                                                 let shift = ctx.input(|i| i.modifiers.shift);
                                                 if !ctrl && !shift {
+                                                    let (v_local, v_mic) = self.get_effective_volume(sound);
                                                     self.audio.play_sound(
                                                         sound.id,
                                                         &sound.name,
                                                         &sound.path,
-                                                        sound.volume_playback,
-                                                        sound.volume_out,
+                                                        v_local,
+                                                        v_mic,
                                                         sound.headphones_enabled,
                                                         sound.mic_enabled,
                                                         &self.state.settings.default_output,
@@ -1492,12 +1529,13 @@ impl SoundboardApp {
                                                 });
                                                 let shift = ctx.input(|i| i.modifiers.shift);
                                                 if !ctrl && !shift {
+                                                    let (v_local, v_mic) = self.get_effective_volume(sound);
                                                     self.audio.play_sound(
                                                         sound.id,
                                                         &sound.name,
                                                         &sound.path,
-                                                        sound.volume_playback,
-                                                        sound.volume_out,
+                                                        v_local,
+                                                        v_mic,
                                                         false,
                                                         true,
                                                         &self.state.settings.default_output,
@@ -1519,12 +1557,13 @@ impl SoundboardApp {
                                                 });
                                                 let shift = ctx.input(|i| i.modifiers.shift);
                                                 if !ctrl && !shift {
+                                                    let (v_local, v_mic) = self.get_effective_volume(sound);
                                                     self.audio.play_sound(
                                                         sound.id,
                                                         &sound.name,
                                                         &sound.path,
-                                                        sound.volume_playback,
-                                                        sound.volume_out,
+                                                        v_local,
+                                                        v_mic,
                                                         true,
                                                         false,
                                                         &self.state.settings.default_output,
@@ -1580,13 +1619,20 @@ impl SoundboardApp {
                             ui.separator();
 
                             // 3. Volume
-                            ui.label("Volume (Local sound):");
-                            if ui.add(egui::Slider::new(&mut s.volume_playback, 0.0..=1.0)).changed() {
+                            let mut vol_changed = ui.checkbox(&mut s.use_global_volume, "Default volume").changed();
+                            
+                            ui.add_enabled_ui(!s.use_global_volume, |ui| {
+                                ui.label("Volume (Local sound):");
+                                vol_changed |= ui.add(egui::Slider::new(&mut s.volume_playback, 0.0..=1.0)).changed();
+                                ui.label("Volume (Mic channel):");
+                                vol_changed |= ui.add(egui::Slider::new(&mut s.volume_out, 0.0..=1.0)).changed();
+                            });
+
+                            if vol_changed {
                                 app.state.save();
-                            }
-                            ui.label("Volume (Mic channel):");
-                            if ui.add(egui::Slider::new(&mut s.volume_out, 0.0..=1.0)).changed() {
-                                app.state.save();
+                                let v_local = if s.use_global_volume { app.state.settings.global_volume_playback } else { s.volume_playback };
+                                let v_mic = if s.use_global_volume { app.state.settings.global_volume_out } else { s.volume_out };
+                                app.audio.update_live_volume(s.id, v_local, v_mic);
                             }
                             ui.separator();
 
@@ -1605,7 +1651,6 @@ impl SoundboardApp {
                             }
                         };
 
-                        // Зв'язуємо однакове меню з усіма респонсами для уникнення "мертвих зон"
                         bg_resp.context_menu(|ui| menu_content(ui, self, sound));
                         play_resp.context_menu(|ui| menu_content(ui, self, sound));
                         info_resp.context_menu(|ui| menu_content(ui, self, sound));
@@ -1694,12 +1739,13 @@ impl eframe::App for SoundboardApp {
                 }).cloned();
 
                 if let Some(sound) = sound_to_play {
+                    let (v_local, v_mic) = self.get_effective_volume(&sound);
                     self.audio.play_sound(
                         sound.id,
                         &sound.name,
                         &sound.path,
-                        sound.volume_playback,
-                        sound.volume_out,
+                        v_local,
+                        v_mic,
                         sound.headphones_enabled,
                         sound.mic_enabled,
                         &self.state.settings.default_output,

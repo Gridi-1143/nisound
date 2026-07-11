@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+fn default_true() -> bool { true }
+fn default_global_volume() -> f32 { 1.0 }
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SoundEntry {
     pub id: Uuid,
@@ -11,6 +14,8 @@ pub struct SoundEntry {
     pub hotkey: Option<String>,
     pub volume_out: f32,
     pub volume_playback: f32,
+    #[serde(default = "default_true")]
+    pub use_global_volume: bool,
     pub mic_enabled: bool,
     pub headphones_enabled: bool,
     pub custom_channels: Option<CustomChannels>,
@@ -54,6 +59,10 @@ pub struct AppSettings {
     /// Technical Pulse *source* name of the real microphone to loop into
     /// `mic_sink` when `mic_loopback_enabled` is true.
     pub mic_loopback_source: String,
+    #[serde(default = "default_global_volume")]
+    pub global_volume_playback: f32,
+    #[serde(default = "default_global_volume")]
+    pub global_volume_out: f32,
     pub colors: HashMap<String, [u8; 3]>,
 }
 
@@ -81,6 +90,8 @@ impl AppState {
                 allow_overlap: true,
                 mic_loopback_enabled: false,
                 mic_loopback_source: "Default".to_string(),
+                global_volume_playback: 1.0,
+                global_volume_out: 1.0,
                 colors,
             },
         }
