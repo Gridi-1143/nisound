@@ -13,7 +13,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-/// A single output stream feeding one PulseAudio sink.
 pub struct PulseSink {
     stop_flag: Arc<AtomicBool>,
     finished_flag: Arc<AtomicBool>,
@@ -46,14 +45,18 @@ pub struct ActiveSound {
 
 pub struct AudioEngine {
     pub active_sounds: Arc<Mutex<Vec<ActiveSound>>>,
+    pub routing_mode: Arc<Mutex<crate::config::RoutingMode>>,
+    pub direct_targets: Arc<Mutex<Vec<String>>>,
 }
 
 pub const DEFAULT_DEVICE: &str = "Default";
 
 impl AudioEngine {
-    pub fn init() -> Self {
+    pub fn init(routing_mode: crate::config::RoutingMode, direct_targets: Vec<String>) -> Self {
         Self {
             active_sounds: Arc::new(Mutex::new(Vec::new())),
+            routing_mode: Arc::new(Mutex::new(routing_mode)),
+            direct_targets: Arc::new(Mutex::new(direct_targets)),
         }
     }
 
@@ -164,13 +167,31 @@ impl AudioEngine {
         )
         .ok()?;
 
+        let mode = self.routing_mode.lock().unwrap().clone();
+        let targets = self.direct_targets.lock().unwrap().clone();
+
         if let Some(sink_name) = &target_sink {
             let priming_ms = 50u32;
             let priming_frames = (sample_rate * priming_ms / 1000) as usize;
             let silence = vec![0u8; priming_frames * channels as usize * 2];
             let _ = simple.write(&silence);
 
-            move_stream_to_sink(&stream_name, sink_name);
+            if is_mic && mode == crate::config::RoutingMode::DirectTarget {
+                // Якщо вибрано DirectTarget, надсилаємо звук у nisound_mic_sink,
+                // і підключаємо монітор sink безпосередньо до обраних ID
+                move_stream_to_sink(&stream_name, "nisound_mic_sink");
+                let active_targets = crate::pipewire_routing::list_active_targets();
+                let selected: Vec<crate::pipewire_routing::PwTargetNode> = active_targets
+                    .into_iter()
+                    .filter(|t| targets.contains(&t.display_name))
+                    .collect();
+
+                std::thread::spawn(move || {
+                    crate::pipewire_routing::link_stream_to_targets(&selected);
+                });
+            } else {
+                move_stream_to_sink(&stream_name, sink_name);
+            }
         }
 
         let stop_flag = Arc::new(AtomicBool::new(false));

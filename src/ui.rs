@@ -69,7 +69,6 @@ pub struct SoundboardApp {
     last_selected_sound: Option<Uuid>,
     confirm_action: Option<PendingAction>,
     keybind_capture: Option<KeybindCapture>,
-    stop_all_hotkey: Option<String>,
 }
 
 impl SoundboardApp {
@@ -84,9 +83,14 @@ impl SoundboardApp {
 
         let (mic_channel_exists, mic_loopback_active) = pulse_devices::mic_channel_status();
 
+        let audio = AudioEngine::init(
+            state.settings.routing_mode.clone(),
+            state.settings.direct_targets.clone(),
+        );
+
         Self {
             state,
-            audio: AudioEngine::init(),
+            audio,
             output_devices,
             input_devices,
             output_filter: DeviceFilter::All,
@@ -112,7 +116,6 @@ impl SoundboardApp {
             last_selected_sound: None,
             confirm_action: None,
             keybind_capture: None,
-            stop_all_hotkey: None,
         }
     }
 
@@ -179,7 +182,6 @@ impl SoundboardApp {
     pub fn render_ui(&mut self, ctx: &Context) {
         self.audio.clean_dead_sinks();
 
-        // ── ОБРОБКА КЛАВІШІ ENTER ───────────────────────────────────────────────
         if ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some(sound_id) = self.last_selected_sound {
                 if let Some(sound) = self.state.sounds.get(&sound_id).cloned() {
@@ -265,67 +267,130 @@ impl SoundboardApp {
                 }
 
                 ui.separator();
-
-                ui.label("Mix voice in:");
-                let loopback_label = Self::device_label(
-                    &self.input_devices,
-                    &self.state.settings.mic_loopback_source,
-                )
-                .to_string();
+                ui.label("Mode:");
                 
-                let mut loopback_source_changed = false;
-                egui::ComboBox::from_id_source("top_loopback_source")
-                    .selected_text(loopback_label)
+                let mut routing_changed = false;
+                egui::ComboBox::from_id_source("routing_mode")
+                    .selected_text(match self.state.settings.routing_mode {
+                        crate::config::RoutingMode::VirtualMic => "Virtual Mic",
+                        crate::config::RoutingMode::DirectTarget => "Direct Target",
+                    })
                     .show_ui(ui, |ui| {
-                        loopback_source_changed |= ui.selectable_value(
-                            &mut self.state.settings.mic_loopback_source,
-                            crate::audio::DEFAULT_DEVICE.to_string(),
-                            "Default",
+                        routing_changed |= ui.selectable_value(
+                            &mut self.state.settings.routing_mode,
+                            crate::config::RoutingMode::VirtualMic,
+                            "Virtual Mic"
                         ).changed();
-                        for dev in self.input_devices.iter().filter(|d| d.kind != DeviceKind::Monitor) {
-                            loopback_source_changed |= ui.selectable_value(
-                                &mut self.state.settings.mic_loopback_source,
-                                dev.name.clone(),
-                                &dev.description,
-                            ).changed();
-                        }
+                        routing_changed |= ui.selectable_value(
+                            &mut self.state.settings.routing_mode,
+                            crate::config::RoutingMode::DirectTarget,
+                            "Direct Target"
+                        ).changed();
                     });
 
-                if loopback_source_changed {
-                    if self.mic_loopback_active {
-                        let ok = pulse_devices::set_mic_loopback(
-                            true,
-                            &self.state.settings.mic_loopback_source,
-                        );
-                        if !ok {
-                            self.error_message = Some("Couldn't update voice loopback source.".to_string());
+                if self.state.settings.routing_mode == crate::config::RoutingMode::DirectTarget {
+                    ui.menu_button("Select Target Apps", |ui| {
+                        let active_targets = crate::pipewire_routing::list_active_targets();
+                        for target in active_targets {
+                            let mut is_selected = self.state.settings.direct_targets.contains(&target.display_name);
+                            if ui.checkbox(&mut is_selected, &target.display_name).changed() {
+                                if is_selected {
+                                    self.state.settings.direct_targets.push(target.display_name.clone());
+                                } else {
+                                    self.state.settings.direct_targets.retain(|t| t != &target.display_name);
+                                    crate::pipewire_routing::unlink_target(&target.display_name);
+                                }
+                                routing_changed = true;
+                            }
                         }
+                    });
+                }
+
+                if routing_changed {
+                    if self.state.settings.routing_mode == crate::config::RoutingMode::DirectTarget {
+                        if self.mic_loopback_active {
+                            self.mic_loopback_active = false;
+                            self.state.settings.mic_loopback_enabled = false;
+                            pulse_devices::set_mic_loopback(false, &self.state.settings.mic_loopback_source);
+                        }
+                    } else {
+                        for target_name in &self.state.settings.direct_targets {
+                            crate::pipewire_routing::unlink_target(target_name);
+                        }
+                    }
+
+                    if let Ok(mut mode) = self.audio.routing_mode.lock() {
+                        *mode = self.state.settings.routing_mode.clone();
+                    }
+                    if let Ok(mut targets) = self.audio.direct_targets.lock() {
+                        *targets = self.state.settings.direct_targets.clone();
                     }
                     self.state.save();
                 }
 
-                let loopback_text = if self.mic_loopback_active {
-                    "🔁 ON"
-                } else {
-                    "🔁 OFF"
-                };
-                if ui.selectable_label(self.mic_loopback_active, loopback_text)
-                    .on_hover_text("Mixes your real microphone into the mic channel.")
-                    .clicked()
-                {
-                    let new_state = !self.mic_loopback_active;
-                    let ok = pulse_devices::set_mic_loopback(
-                        new_state,
+                if self.state.settings.routing_mode == crate::config::RoutingMode::VirtualMic {
+                    ui.separator();
+                    ui.label("Mix voice in:");
+                    let loopback_label = Self::device_label(
+                        &self.input_devices,
                         &self.state.settings.mic_loopback_source,
-                    );
-                    if ok {
-                        self.state.settings.mic_loopback_enabled = new_state;
+                    )
+                    .to_string();
+                    
+                    let mut loopback_source_changed = false;
+                    egui::ComboBox::from_id_source("top_loopback_source")
+                        .selected_text(loopback_label)
+                        .show_ui(ui, |ui| {
+                            loopback_source_changed |= ui.selectable_value(
+                                &mut self.state.settings.mic_loopback_source,
+                                crate::audio::DEFAULT_DEVICE.to_string(),
+                                "Default",
+                            ).changed();
+                            for dev in self.input_devices.iter().filter(|d| d.kind != DeviceKind::Monitor) {
+                                loopback_source_changed |= ui.selectable_value(
+                                    &mut self.state.settings.mic_loopback_source,
+                                    dev.name.clone(),
+                                    &dev.description,
+                                ).changed();
+                            }
+                        });
+
+                    if loopback_source_changed {
+                        if self.mic_loopback_active {
+                            let ok = pulse_devices::set_mic_loopback(
+                                true,
+                                &self.state.settings.mic_loopback_source,
+                            );
+                            if !ok {
+                                self.error_message = Some("Couldn't update voice loopback source.".to_string());
+                            }
+                        }
                         self.state.save();
-                        self.refresh_mic_channel_status();
+                    }
+
+                    let loopback_text = if self.mic_loopback_active {
+                        "🔁 ON"
                     } else {
-                        self.error_message = Some(
-                            "Couldn't toggle voice loopback.".to_string(),
+                        "🔁 OFF"
+                    };
+                    if ui.selectable_label(self.mic_loopback_active, loopback_text)
+                        .on_hover_text("Mixes your real microphone into the mic channel.")
+                        .clicked()
+                    {
+                        let new_state = !self.mic_loopback_active;
+                        let ok = pulse_devices::set_mic_loopback(
+                            new_state,
+                            &self.state.settings.mic_loopback_source,
                         );
+                        if ok {
+                            self.state.settings.mic_loopback_enabled = new_state;
+                            self.state.save();
+                            self.refresh_mic_channel_status();
+                        } else {
+                            self.error_message = Some(
+                                "Couldn't toggle voice loopback.".to_string(),
+                            );
+                        }
                     }
                 }
 
@@ -333,10 +398,36 @@ impl SoundboardApp {
                 
                 ui.label("Global Vol:");
                 let mut global_vol_changed = false;
+                
                 ui.label("🎧");
-                global_vol_changed |= ui.add_sized([50.0, 16.0], egui::Slider::new(&mut self.state.settings.global_volume_playback, 0.0..=1.0).show_value(false)).changed();
+                let hp_slider = ui.add_sized(
+                    [65.0, 16.0],
+                    egui::Slider::new(&mut self.state.settings.global_volume_playback, 0.0..=2.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                );
+                if hp_slider.changed() {
+                    global_vol_changed = true;
+                }
+                if hp_slider.secondary_clicked() {
+                    self.state.settings.global_volume_playback = 1.0;
+                    global_vol_changed = true;
+                }
+                hp_slider.on_hover_text("RMB to reset to 100%");
+
                 ui.label("🎙");
-                global_vol_changed |= ui.add_sized([50.0, 16.0], egui::Slider::new(&mut self.state.settings.global_volume_out, 0.0..=1.0).show_value(false)).changed();
+                let mic_slider = ui.add_sized(
+                    [65.0, 16.0],
+                    egui::Slider::new(&mut self.state.settings.global_volume_out, 0.0..=2.0)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                );
+                if mic_slider.changed() {
+                    global_vol_changed = true;
+                }
+                if mic_slider.secondary_clicked() {
+                    self.state.settings.global_volume_out = 1.0;
+                    global_vol_changed = true;
+                }
+                mic_slider.on_hover_text("RMB to reset to 100%");
 
                 if global_vol_changed {
                     self.state.save();
@@ -499,12 +590,13 @@ impl SoundboardApp {
                                             if cap.alt   { combo.push_str("Alt+"); }
                                             if cap.shift { combo.push_str("Shift+"); }
                                             combo.push_str(&format!("{:?}", key));
-                                            self.stop_all_hotkey = Some(combo);
+                                            self.state.settings.stop_all_hotkey = Some(combo);
+                                            self.state.save();
                                         }
                                     }
                                 }
                             } else {
-                                let btn_text = match &self.stop_all_hotkey {
+                                let btn_text = match &self.state.settings.stop_all_hotkey {
                                     Some(hk) => format!("⌨ {}", hk),
                                     None => "➕".to_string(),
                                 };
@@ -518,7 +610,8 @@ impl SoundboardApp {
                                         shift: mods.shift,
                                     });
                                 } else if btn_resp.secondary_clicked() {
-                                    self.stop_all_hotkey = None
+                                    self.state.settings.stop_all_hotkey = None;
+                                    self.state.save();
                                 }
                                 btn_resp.on_hover_text("LMB to assign hotkey, RMB to remove");
                             }
@@ -994,7 +1087,7 @@ impl SoundboardApp {
                                     ui.strong("Hotkey:");
                                     ui.horizontal(|ui| {
                                         let is_capturing = self.keybind_capture.as_ref()
-                                            .map(|k| k.target == KeybindTarget::Sound(sound_id))
+                                            .map(|k| k.target == KeybindTarget::Sound(sound.id))
                                             .unwrap_or(false);
 
                                         if is_capturing {
@@ -1042,7 +1135,7 @@ impl SoundboardApp {
                                             if btn_resp.clicked() {
                                                 let mods = ctx.input(|i| i.modifiers);
                                                 self.keybind_capture = Some(KeybindCapture {
-                                                    target: KeybindTarget::Sound(sound_id),
+                                                    target: KeybindTarget::Sound(sound.id),
                                                     ctrl:  mods.command || mods.ctrl,
                                                     alt:   mods.alt,
                                                     shift: mods.shift,
@@ -1062,13 +1155,19 @@ impl SoundboardApp {
 
                                     ui.strong("Volume (Local):");
                                     ui.add_enabled_ui(!sound.use_global_volume, |ui| {
-                                        vol_changed |= ui.add(egui::Slider::new(&mut sound.volume_playback, 0.0..=1.0).text("local sound")).changed();
+                                        let s = ui.add(egui::Slider::new(&mut sound.volume_playback, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)).text("local"));
+                                        if s.changed() { vol_changed = true; }
+                                        if s.secondary_clicked() { sound.volume_playback = 1.0; vol_changed = true; }
+                                        s.on_hover_text("RMB to reset to 100%");
                                     });
                                     ui.end_row();
 
                                     ui.strong("Volume (Mic):");
                                     ui.add_enabled_ui(!sound.use_global_volume, |ui| {
-                                        vol_changed |= ui.add(egui::Slider::new(&mut sound.volume_out, 0.0..=1.0).text("mic channel")).changed();
+                                        let s = ui.add(egui::Slider::new(&mut sound.volume_out, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)).text("mic"));
+                                        if s.changed() { vol_changed = true; }
+                                        if s.secondary_clicked() { sound.volume_out = 1.0; vol_changed = true; }
+                                        s.on_hover_text("RMB to reset to 100%");
                                     });
                                     ui.end_row();
 
@@ -1579,9 +1678,7 @@ impl SoundboardApp {
                             })
                             .inner;
 
-                        // ── ОБ'ЄДНАНЕ КОНТЕКСТНЕ МЕНЮ (СПІЛЬНИЙ ХІТБОКС) ───
                         let menu_content = |ui: &mut egui::Ui, app: &mut Self, s: &mut SoundEntry| {
-                            // 1. Shortcut
                             ui.label("Shortcut:");
                             if s.hotkey.is_some() {
                                 if ui.button("Clear Shortcut").clicked() {
@@ -1594,7 +1691,6 @@ impl SoundboardApp {
                             }
                             ui.separator();
 
-                            // 2. Delete / Remove from folder
                             if app.state.active_folder.is_some() {
                                 if ui.button("Remove from folder").clicked() {
                                     if app.selected_sounds.contains(&s.id) {
@@ -1618,14 +1714,20 @@ impl SoundboardApp {
                             }
                             ui.separator();
 
-                            // 3. Volume
                             let mut vol_changed = ui.checkbox(&mut s.use_global_volume, "Default volume").changed();
                             
                             ui.add_enabled_ui(!s.use_global_volume, |ui| {
                                 ui.label("Volume (Local sound):");
-                                vol_changed |= ui.add(egui::Slider::new(&mut s.volume_playback, 0.0..=1.0)).changed();
+                                let hp_s = ui.add(egui::Slider::new(&mut s.volume_playback, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                                if hp_s.changed() { vol_changed = true; }
+                                if hp_s.secondary_clicked() { s.volume_playback = 1.0; vol_changed = true; }
+                                hp_s.on_hover_text("RMB to reset to 100%");
+
                                 ui.label("Volume (Mic channel):");
-                                vol_changed |= ui.add(egui::Slider::new(&mut s.volume_out, 0.0..=1.0)).changed();
+                                let mic_s = ui.add(egui::Slider::new(&mut s.volume_out, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+                                if mic_s.changed() { vol_changed = true; }
+                                if mic_s.secondary_clicked() { s.volume_out = 1.0; vol_changed = true; }
+                                mic_s.on_hover_text("RMB to reset to 100%");
                             });
 
                             if vol_changed {
@@ -1636,14 +1738,12 @@ impl SoundboardApp {
                             }
                             ui.separator();
 
-                            // 4. Settings
                             if ui.button("Settings").clicked() {
                                 app.active_sound_popup = Some(s.id);
                                 app.active_sound_popup_tab = 0;
                                 ui.close_menu();
                             }
 
-                            // 5. Edit
                             if ui.button("Edit").clicked() {
                                 app.active_sound_popup = Some(s.id);
                                 app.active_sound_popup_tab = 1;
@@ -1656,7 +1756,6 @@ impl SoundboardApp {
                         info_resp.context_menu(|ui| menu_content(ui, self, sound));
                         channels_resp.context_menu(|ui| menu_content(ui, self, sound));
 
-                        // ── SELECTION LOGIC ───────────────────────────────────
                         let ctrl = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
                         let shift = ctx.input(|i| i.modifiers.shift);
 
@@ -1721,8 +1820,8 @@ impl eframe::App for SoundboardApp {
             while let Ok(crate::GlobalEvent::HotkeyTriggered(key_str)) = rx.try_recv() {
                 let mut stopped_all = false;
                 
-                if let Some(hk) = &self.stop_all_hotkey {
-                    if hk == &key_str || hk.ends_with(&format!("+{}", key_str)) {
+                if let Some(hk) = &self.state.settings.stop_all_hotkey {
+                    if hk == &key_str {
                         self.audio.stop_all();
                         stopped_all = true;
                     }
@@ -1734,7 +1833,7 @@ impl eframe::App for SoundboardApp {
 
                 let sound_to_play = self.state.sounds.values().find(|s| {
                     s.hotkey.as_deref().map(|hk| {
-                        hk == &key_str || hk.ends_with(&format!("+{}", key_str))
+                        hk == &key_str
                     }).unwrap_or(false)
                 }).cloned();
 
