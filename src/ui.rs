@@ -1,10 +1,13 @@
-use crate::audio::AudioEngine;
+use crate::audio::{AudioEngine, QueueItem};
 use crate::config::{AppState, Folder, SoundEntry};
 use crate::pulse_devices::{self, AudioDevice, DeviceFilter, DeviceKind};
 use egui::{Color32, Context, Ui};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::Duration;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -45,6 +48,7 @@ pub struct SoundboardApp {
     pub state: AppState,
     pub audio: AudioEngine,
     pub selected_sounds: HashSet<Uuid>,
+    pub selected_queue_id: Option<Uuid>,
     pub show_settings: bool,
     pub active_settings_tab: usize,
     pub hotkey_rx: Option<std::sync::mpsc::Receiver<crate::GlobalEvent>>,
@@ -69,6 +73,9 @@ pub struct SoundboardApp {
     last_selected_sound: Option<Uuid>,
     confirm_action: Option<PendingAction>,
     keybind_capture: Option<KeybindCapture>,
+    dragged_queue_index: Option<usize>,
+    metadata_tx: Sender<(Uuid, PathBuf)>,
+    metadata_rx: Receiver<(Uuid, Option<u64>)>,
 }
 
 impl SoundboardApp {
@@ -88,6 +95,23 @@ impl SoundboardApp {
             state.settings.direct_targets.clone(),
         );
 
+        let (task_tx, task_rx) = channel::<(Uuid, PathBuf)>();
+        let (res_tx, res_rx) = channel::<(Uuid, Option<u64>)>();
+
+        std::thread::spawn(move || {
+            while let Ok((id, path)) = task_rx.recv() {
+                let duration = crate::config::compute_duration_fast(&path);
+                let _ = res_tx.send((id, duration));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        for (id, sound) in &state.sounds {
+            if sound.duration_secs.is_none() && sound.exists {
+                let _ = task_tx.send((*id, sound.path.clone()));
+            }
+        }
+
         Self {
             state,
             audio,
@@ -101,6 +125,7 @@ impl SoundboardApp {
             search_query: String::new(),
             sort_order: SortOrder::TimeDesc,
             selected_sounds: HashSet::new(),
+            selected_queue_id: None,
             show_settings: false,
             active_settings_tab: 0,
             pending_folder_import: None,
@@ -116,6 +141,9 @@ impl SoundboardApp {
             last_selected_sound: None,
             confirm_action: None,
             keybind_capture: None,
+            dragged_queue_index: None,
+            metadata_tx: task_tx,
+            metadata_rx: res_rx,
         }
     }
 
@@ -180,12 +208,23 @@ impl SoundboardApp {
     }
 
     pub fn render_ui(&mut self, ctx: &Context) {
-        self.audio.clean_dead_sinks();
+        let mut save_needed = false;
+        while let Ok((id, dur)) = self.metadata_rx.try_recv() {
+            if let Some(sound) = self.state.sounds.get_mut(&id) {
+                sound.duration_secs = dur;
+                save_needed = true;
+            }
+        }
+        if save_needed {
+            self.state.save();
+        }
+
+        self.audio.clean_dead_sinks(&self.state);
 
         if ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some(sound_id) = self.last_selected_sound {
-                if let Some(sound) = self.state.sounds.get(&sound_id).cloned() {
-                    let (v_local, v_mic) = self.get_effective_volume(&sound);
+                if let Some(sound) = self.state.sounds.get(&sound_id) {
+                    let (v_local, v_mic) = self.get_effective_volume(sound);
                     self.audio.play_sound(
                         sound.id,
                         &sound.name,
@@ -196,7 +235,9 @@ impl SoundboardApp {
                         sound.mic_enabled,
                         &self.state.settings.default_output,
                         &self.state.settings.mic_sink,
+                        sound.duration_secs,
                         self.state.settings.allow_overlap,
+                        self.state.settings.queue_sounds,
                     );
                 }
             }
@@ -414,7 +455,7 @@ impl SoundboardApp {
                 }
                 hp_slider.on_hover_text("RMB to reset to 100%");
 
-                ui.label("🎙");
+                ui.label("🔊");
                 let mic_slider = ui.add_sized(
                     [65.0, 16.0],
                     egui::Slider::new(&mut self.state.settings.global_volume_out, 0.0..=2.0)
@@ -447,28 +488,47 @@ impl SoundboardApp {
 
         // ── RIGHT PANEL: Categories + Playback ──────────────────────────────
         egui::SidePanel::right("folders")
-            .width_range(200.0..=230.0)
+            .resizable(true)
+            .default_width(560.0)
+            .width_range(560.0..=560.0)
             .show(ctx, |ui| {
-                let active_snapshot: Vec<(Uuid, String)> = self
-                    .audio
-                    .active_sounds
-                    .lock()
-                    .map(|a| a.iter().map(|s| (s.play_id, s.name.clone())).collect())
-                    .unwrap_or_default();
+                let active_snapshot: Vec<(Uuid, String, bool, bool, f32, Option<u64>)> = {
+                    if let Ok(active) = self.audio.active_sounds.lock() {
+                        active.iter().map(|s| {
+                            let is_paused = s.sinks.first().map(|sink| sink.is_paused.load(Ordering::Relaxed)).unwrap_or(false);
+                            let is_looping = s.sinks.first().map(|sink| sink.is_looping.load(Ordering::Relaxed)).unwrap_or(false);
+                            let progress_secs = s.sinks.first().map(|sink| {
+                                let frames = sink.progress_frames.load(Ordering::Relaxed);
+                                (frames as f64 / sink.sample_rate as f64) as f32
+                            }).unwrap_or(0.0);
+                            (s.play_id, s.name.clone(), is_paused, is_looping, progress_secs, s.duration_secs)
+                        }).collect()
+                    } else {
+                        Vec::new()
+                    }
+                };
+                
+                let queued_snapshot: Vec<QueueItem> = {
+                    if let Ok(queue) = self.audio.pending_queue.lock() {
+                        queue.clone()
+                    } else {
+                        Vec::new()
+                    }
+                };
 
                 let total_height = ui.available_height();
 
                 egui::ScrollArea::vertical()
                     .id_source("folders_scroll")
-                    .max_height(total_height * 0.5)
+                    .max_height(total_height * 0.35)
                     .show(ui, |ui| {
                         let all_sounds_btn =
-                            ui.selectable_label(self.state.active_folder.is_none(), "all sounds");
+                            ui.selectable_label(self.state.active_folder.is_none(), "📁 All Sounds");
                         if all_sounds_btn.clicked() {
                             self.state.active_folder = None;
                         }
                         all_sounds_btn.context_menu(|ui| {
-                            if ui.button("clear all sounds").clicked() {
+                            if ui.button("Clear all sounds").clicked() {
                                 self.show_clear_all_confirm = true;
                                 ui.close_menu();
                             }
@@ -480,7 +540,7 @@ impl SoundboardApp {
 
                         for folder in &self.state.folders {
                             let is_selected = self.state.active_folder == Some(folder.id);
-                            let response = ui.selectable_label(is_selected, &folder.name);
+                            let response = ui.selectable_label(is_selected, format!("📁 {}", folder.name));
 
                             if response.clicked() {
                                 self.state.active_folder = Some(folder.id);
@@ -491,7 +551,7 @@ impl SoundboardApp {
                             }
 
                             response.context_menu(|ui| {
-                                if ui.button("delete folder").clicked() {
+                                if ui.button("Delete folder").clicked() {
                                     self.confirm_action =
                                         Some(PendingAction::DeleteFolder(folder.id));
                                     ui.close_menu();
@@ -522,7 +582,7 @@ impl SoundboardApp {
                             egui::Sense::click(),
                         );
                         empty_space_resp.context_menu(|ui| {
-                            if ui.button("create new folder").clicked() {
+                            if ui.button("Create new folder").clicked() {
                                 self.show_new_folder_dialog = true;
                                 ui.close_menu();
                             }
@@ -532,111 +592,280 @@ impl SoundboardApp {
                 ui.separator();
 
                 egui::ScrollArea::vertical().id_source("playback_scroll").show(ui, |ui| {
-                    ui.add_space(4.0);
+                    ui.add_space(2.0);
                     
-                    let overlap_text = if self.state.settings.allow_overlap {
-                        "🎵 Overlap: ON"
-                    } else {
-                        "🎵 Overlap: OFF"
-                    };
-                    if ui.selectable_label(self.state.settings.allow_overlap, overlap_text)
-                        .on_hover_text("ON: sounds can play on top of each other. OFF: starting a sound stops all others.")
-                        .clicked()
-                    {
-                        self.state.settings.allow_overlap = !self.state.settings.allow_overlap;
-                        self.state.save();
-                    }
+                    ui.horizontal(|ui| {
+                        let overlap_text = if self.state.settings.allow_overlap {
+                            "🎵 Overlap: ON"
+                        } else {
+                            "🎵 Overlap: OFF"
+                        };
+                        if ui.selectable_label(self.state.settings.allow_overlap, overlap_text)
+                            .on_hover_text("ON: sounds can play on top of each other. OFF: starting a sound stops all others.")
+                            .clicked()
+                        {
+                            self.state.settings.allow_overlap = !self.state.settings.allow_overlap;
+                            self.state.save();
+                        }
+
+                        if !self.state.settings.allow_overlap {
+                            if ui.checkbox(&mut self.state.settings.queue_sounds, "Queue")
+                                .on_hover_text("Queue sounds sequentially instead of replacing")
+                                .changed()
+                            {
+                                self.state.save();
+                            }
+                        }
+                    });
                     
                     ui.separator();
 
                     ui.horizontal(|ui| {
                         ui.heading("Playback");
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button("⏹ Stop All").clicked() {
-                                self.audio.stop_all();
+                        
+                        if ui.button("⏹ Stop All").clicked() {
+                            self.audio.stop_all();
+                        }
+
+                        let is_capturing = self.keybind_capture.as_ref()
+                            .map(|k| k.target == KeybindTarget::StopAll)
+                            .unwrap_or(false);
+
+                        if is_capturing {
+                            let capture = self.keybind_capture.as_ref().unwrap();
+                            let mut preview = String::new();
+                            if capture.ctrl  { preview.push_str("Ctrl+"); }
+                            if capture.alt   { preview.push_str("Alt+"); }
+                            if capture.shift { preview.push_str("Shift+"); }
+                            preview.push_str("...");
+
+                            ui.colored_label(Color32::YELLOW, &preview);
+
+                            let events = ctx.input(|i| i.events.clone());
+                            let mods = ctx.input(|i| i.modifiers);
+
+                            if let Some(cap) = self.keybind_capture.as_mut() {
+                                cap.ctrl  = mods.command || mods.ctrl;
+                                cap.alt   = mods.alt;
+                                cap.shift = mods.shift;
                             }
 
-                            let is_capturing = self.keybind_capture.as_ref()
-                                .map(|k| k.target == KeybindTarget::StopAll)
-                                .unwrap_or(false);
-
-                            if is_capturing {
-                                let capture = self.keybind_capture.as_ref().unwrap();
-                                let mut preview = String::new();
-                                if capture.ctrl  { preview.push_str("Ctrl+"); }
-                                if capture.alt   { preview.push_str("Alt+"); }
-                                if capture.shift { preview.push_str("Shift+"); }
-                                preview.push_str("...");
-
-                                ui.colored_label(Color32::YELLOW, &preview);
-
-                                let events = ctx.input(|i| i.events.clone());
-                                let mods = ctx.input(|i| i.modifiers);
-
-                                if let Some(cap) = self.keybind_capture.as_mut() {
-                                    cap.ctrl  = mods.command || mods.ctrl;
-                                    cap.alt   = mods.alt;
-                                    cap.shift = mods.shift;
-                                }
-
-                                for e in events {
-                                    if let egui::Event::Key { key, pressed: true, .. } = e {
-                                        if key == egui::Key::Escape {
-                                            self.keybind_capture = None;
-                                        } else {
-                                            let cap = self.keybind_capture.take().unwrap();
-                                            let mut combo = String::new();
-                                            if cap.ctrl  { combo.push_str("Ctrl+"); }
-                                            if cap.alt   { combo.push_str("Alt+"); }
-                                            if cap.shift { combo.push_str("Shift+"); }
-                                            combo.push_str(&format!("{:?}", key));
-                                            self.state.settings.stop_all_hotkey = Some(combo);
-                                            self.state.save();
-                                        }
+                            for e in events {
+                                if let egui::Event::Key { key, pressed: true, .. } = e {
+                                    if key == egui::Key::Escape {
+                                        self.keybind_capture = None;
+                                    } else {
+                                        let cap = self.keybind_capture.take().unwrap();
+                                        let mut combo = String::new();
+                                        if cap.ctrl  { combo.push_str("Ctrl+"); }
+                                        if cap.alt   { combo.push_str("Alt+"); }
+                                        if cap.shift { combo.push_str("Shift+"); }
+                                        combo.push_str(&format!("{:?}", key));
+                                        self.state.settings.stop_all_hotkey = Some(combo);
+                                        self.state.save();
                                     }
                                 }
-                            } else {
-                                let btn_text = match &self.state.settings.stop_all_hotkey {
-                                    Some(hk) => format!("⌨ {}", hk),
-                                    None => "➕".to_string(),
-                                };
-                                let btn_resp = ui.small_button(&btn_text);
-                                if btn_resp.clicked() {
-                                    let mods = ctx.input(|i| i.modifiers);
-                                    self.keybind_capture = Some(KeybindCapture {
-                                        target: KeybindTarget::StopAll,
-                                        ctrl:  mods.command || mods.ctrl,
-                                        alt:   mods.alt,
-                                        shift: mods.shift,
-                                    });
-                                } else if btn_resp.secondary_clicked() {
-                                    self.state.settings.stop_all_hotkey = None;
-                                    self.state.save();
-                                }
-                                btn_resp.on_hover_text("LMB to assign hotkey, RMB to remove");
                             }
-                        });
+                        } else {
+                            let btn_text = match &self.state.settings.stop_all_hotkey {
+                                Some(hk) => format!("⌨ {}", hk),
+                                None => "➕ Hotkey".to_string(),
+                            };
+                            let btn_resp = ui.small_button(&btn_text);
+                            if btn_resp.clicked() {
+                                let mods = ctx.input(|i| i.modifiers);
+                                self.keybind_capture = Some(KeybindCapture {
+                                    target: KeybindTarget::StopAll,
+                                    ctrl:  mods.command || mods.ctrl,
+                                    alt:   mods.alt,
+                                    shift: mods.shift,
+                                });
+                            } else if btn_resp.secondary_clicked() {
+                                self.state.settings.stop_all_hotkey = None;
+                                self.state.save();
+                            }
+                            btn_resp.on_hover_text("LMB to assign hotkey, RMB to remove");
+                        }
                     });
                         
                     ui.separator();
 
-                    if active_snapshot.is_empty() {
+                    if active_snapshot.is_empty() && queued_snapshot.is_empty() {
                         ui.weak("Nothing playing");
                     } else {
                         let mut to_stop: Option<Uuid> = None;
+                        let mut to_pause: Option<Uuid> = None;
+                        let mut to_loop: Option<Uuid> = None;
 
-                        for (play_id, name) in &active_snapshot {
-                            ui.horizontal(|ui| {
-                                if ui.add_sized([18.0, 18.0], egui::Button::new("✕").fill(Color32::from_rgb(160, 60, 60))).clicked() {
-                                    to_stop = Some(*play_id);
-                                }
-                                let label = Self::truncate_name(name, 22);
-                                ui.label(label);
+                        for (play_id, name, is_paused, is_looping, progress_secs, duration) in &active_snapshot {
+                            ui.group(|ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    if ui.add_sized([22.0, 22.0], egui::Button::new("X").fill(Color32::from_rgb(160, 60, 60))).clicked() {
+                                        to_stop = Some(*play_id);
+                                    }
+                                    
+                                    let pause_icon = if *is_paused { "▶" } else { "⏸" };
+                                    if ui.add_sized([22.0, 22.0], egui::Button::new(pause_icon)).clicked() {
+                                        to_pause = Some(*play_id);
+                                    }
+                                    
+                                    let loop_color = if *is_looping { Color32::GREEN } else { Color32::GRAY };
+                                    if ui.add_sized([22.0, 22.0], egui::Button::new(egui::RichText::new("🔁").color(loop_color))).on_hover_text("Loop sound").clicked() {
+                                        to_loop = Some(*play_id);
+                                    }
+
+                                    let label = Self::truncate_name(name, 26);
+                                    ui.label(egui::RichText::new(label).strong());
+                                });
+
+                                ui.horizontal(|ui| {
+                                    let current_mins = (*progress_secs as u32) / 60;
+                                    let current_secs = (*progress_secs as u32) % 60;
+                                    
+                                    if let Some(total_secs) = duration {
+                                        ui.label(format!("{:02}:{:02} / {:02}:{:02}", current_mins, current_secs, total_secs / 60, total_secs % 60));
+                                        let ratio = (*progress_secs / (*total_secs as f32)).clamp(0.0, 1.0);
+                                        ui.add(egui::ProgressBar::new(ratio).animate(!*is_paused));
+                                    } else {
+                                        ui.label(format!("{:02}:{:02}", current_mins, current_secs));
+                                        ui.add(egui::ProgressBar::new(0.0).animate(!*is_paused));
+                                    }
+                                });
                             });
+                            ui.add_space(2.0);
+                        }
+
+                        if !queued_snapshot.is_empty() {
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(format!("Queue ({})", queued_snapshot.len())).strong());
+                                
+                                if ui.small_button("Clear").on_hover_text("Clear entire queue").clicked() {
+                                    if let Ok(mut queue) = self.audio.pending_queue.lock() {
+                                        queue.clear();
+                                    }
+                                    self.selected_queue_id = None;
+                                }
+                            });
+
+                            let mut reordered_queue = queued_snapshot.clone();
+                            let mut queue_modified = false;
+                            let mut delete_queue_id: Option<Uuid> = None;
+
+                            for (idx, q_item) in queued_snapshot.iter().enumerate() {
+                                let is_selected = self.selected_queue_id == Some(q_item.queue_id);
+                                let is_being_dragged = self.dragged_queue_index == Some(idx);
+                                
+                                let frame_color = if is_being_dragged {
+                                    Color32::from_rgb(90, 110, 160)
+                                } else if is_selected {
+                                    Color32::from_rgb(70, 90, 140)
+                                } else {
+                                    Color32::from_rgb(38, 38, 48)
+                                };
+
+                                let frame = egui::Frame::none()
+                                    .fill(frame_color)
+                                    .inner_margin(4.0)
+                                    .rounding(4.0);
+
+                                ui.push_id(("queue_card", q_item.queue_id), |ui| {
+                                    frame.show(ui, |ui| {
+                                        ui.style_mut().interaction.selectable_labels = false;
+                                        ui.set_width(ui.available_width());
+
+                                        let full_row_rect = ui.available_rect_before_wrap();
+                                        let bg_resp = ui.interact(
+                                            full_row_rect,
+                                            ui.id().with("queue_bg_interact"),
+                                            egui::Sense::click_and_drag(),
+                                        );
+
+                                        if bg_resp.drag_started() {
+                                            self.dragged_queue_index = Some(idx);
+                                            self.selected_queue_id = Some(q_item.queue_id);
+                                        }
+
+                                        if bg_resp.hovered() {
+                                            if let Some(from_idx) = self.dragged_queue_index {
+                                                if from_idx != idx {
+                                                    let item = reordered_queue.remove(from_idx);
+                                                    reordered_queue.insert(idx, item);
+                                                    self.dragged_queue_index = Some(idx);
+                                                    queue_modified = true;
+                                                }
+                                            }
+                                        }
+
+                                        if bg_resp.clicked() {
+                                            if self.selected_queue_id == Some(q_item.queue_id) {
+                                                self.selected_queue_id = None;
+                                            } else {
+                                                self.selected_queue_id = Some(q_item.queue_id);
+                                            }
+                                        }
+
+                                        ui.horizontal(|ui| {
+                                            let del_resp = ui.add_sized(
+                                                [20.0, 20.0],
+                                                egui::Button::new("X").fill(Color32::from_rgb(150, 50, 50))
+                                            );
+                                            if del_resp.clicked() {
+                                                delete_queue_id = Some(q_item.queue_id);
+                                            }
+
+                                            ui.label(egui::RichText::new("☰").weak());
+
+                                            let text_label = format!("{}. {}", idx + 1, Self::truncate_name(&q_item.name, 24));
+                                            ui.label(egui::RichText::new(text_label).strong());
+                                        });
+                                    });
+                                });
+                                ui.add_space(2.0);
+                            }
+
+                            if self.dragged_queue_index.is_some() {
+                                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                                if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                                    egui::Area::new(egui::Id::new("queue_drag_tooltip"))
+                                        .fixed_pos(pos + egui::vec2(15.0, 15.0))
+                                        .order(egui::Order::Tooltip)
+                                        .show(ctx, |ui| {
+                                            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                                ui.label("📦 Moving in queue");
+                                            });
+                                        });
+                                }
+                            }
+
+                            if ctx.input(|i| i.pointer.any_released()) {
+                                self.dragged_queue_index = None;
+                            }
+
+                            if let Some(del_id) = delete_queue_id {
+                                reordered_queue.retain(|q| q.queue_id != del_id);
+                                if self.selected_queue_id == Some(del_id) {
+                                    self.selected_queue_id = None;
+                                }
+                                queue_modified = true;
+                            }
+
+                            if queue_modified {
+                                if let Ok(mut queue) = self.audio.pending_queue.lock() {
+                                    *queue = reordered_queue;
+                                }
+                            }
                         }
 
                         if let Some(pid) = to_stop {
-                            self.audio.stop_sound(pid);
+                            self.audio.stop_sound(pid, &self.state);
+                        }
+                        if let Some(pid) = to_pause {
+                            self.audio.toggle_pause(pid);
+                        }
+                        if let Some(pid) = to_loop {
+                            self.audio.toggle_loop(pid);
                         }
                     }
                 });
@@ -721,6 +950,8 @@ impl SoundboardApp {
                 let available_width = ui.available_width().max(cell_width);
                 let columns = ((available_width / cell_width).floor() as usize).max(1);
 
+                let mut sounds_to_update: Vec<SoundEntry> = Vec::new();
+
                 egui::Grid::new(("sounds_grid", self.state.active_folder))
                     .num_columns(columns)
                     .spacing([10.0, 10.0])
@@ -728,11 +959,13 @@ impl SoundboardApp {
                     .max_col_width(cell_width)
                     .show(ui, |ui| {
                         let mut col_count = 0;
-                        for id in sound_ids_to_render.iter() {
-                            let id = *id;
-                            if let Some(mut sound) = self.state.sounds.get(&id).cloned() {
-                                self.render_sound_widget(ui, &mut sound, ctx, &sound_ids_to_render);
-                                self.state.sounds.insert(id, sound);
+                        for id in &sound_ids_to_render {
+                            if let Some(sound) = self.state.sounds.get(id) {
+                                let mut sound_copy = sound.clone();
+                                let modified = self.render_sound_widget(ui, &mut sound_copy, ctx, &sound_ids_to_render);
+                                if modified {
+                                    sounds_to_update.push(sound_copy);
+                                }
 
                                 col_count += 1;
                                 if col_count == columns {
@@ -742,6 +975,13 @@ impl SoundboardApp {
                             }
                         }
                     });
+
+                if !sounds_to_update.is_empty() {
+                    for sound in sounds_to_update {
+                        self.state.sounds.insert(sound.id, sound);
+                    }
+                    self.state.save();
+                }
             });
         });
 
@@ -1178,13 +1418,19 @@ impl SoundboardApp {
                                         self.audio.update_live_volume(sound_id, v_local, v_mic);
                                     }
 
+                                    let mut ch_changed = false;
                                     ui.strong("Local sound:");
-                                    changed |= ui.checkbox(&mut sound.headphones_enabled, "enabled").changed();
+                                    ch_changed |= ui.checkbox(&mut sound.headphones_enabled, "enabled").changed();
                                     ui.end_row();
 
                                     ui.strong("Mic:");
-                                    changed |= ui.checkbox(&mut sound.mic_enabled, "enabled").changed();
+                                    ch_changed |= ui.checkbox(&mut sound.mic_enabled, "enabled").changed();
                                     ui.end_row();
+
+                                    if ch_changed {
+                                        changed = true;
+                                        self.audio.update_live_channels(sound_id, sound.headphones_enabled, sound.mic_enabled);
+                                    }
 
                                     ui.strong("Channel routing:");
                                     match &sound.custom_channels {
@@ -1277,8 +1523,9 @@ impl SoundboardApp {
                 }
                 None => {
                     let id = Uuid::new_v4();
-                    let entry = Self::make_sound_entry(id, path);
+                    let entry = Self::make_sound_entry(id, path.clone());
                     self.state.sounds.insert(id, entry);
+                    let _ = self.metadata_tx.send((id, path));
 
                     if let Some(folder_id) = target_folder {
                         if let Some(folder) = self.state.folders.iter_mut().find(|f| f.id == folder_id) {
@@ -1319,6 +1566,7 @@ impl SoundboardApp {
             mic_enabled: true,
             headphones_enabled: true,
             custom_channels: None,
+            duration_secs: None,
             time_added: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1371,7 +1619,8 @@ impl SoundboardApp {
         sound: &mut SoundEntry,
         ctx: &Context,
         all_ids: &[Uuid],
-    ) {
+    ) -> bool {
+        let mut sound_changed = false;
         ui.push_id(("sound_card", sound.id), |ui| {
             let is_selected = self.selected_sounds.contains(&sound.id);
 
@@ -1407,7 +1656,7 @@ impl SoundboardApp {
                                 .show(ctx, |ui| {
                                     egui::Frame::popup(ui.style()).show(ui, |ui| {
                                         ui.label(format!(
-                                            "📦 Moving {} sound(s)",
+                                            "Moving {} sound(s)",
                                             self.selected_sounds.len()
                                         ));
                                     });
@@ -1451,7 +1700,9 @@ impl SoundboardApp {
                                                         sound.mic_enabled,
                                                         &self.state.settings.default_output,
                                                         &self.state.settings.mic_sink,
+                                                        sound.duration_secs,
                                                         self.state.settings.allow_overlap,
+                                                        self.state.settings.queue_sounds,
                                                     );
                                                 }
                                             }
@@ -1484,7 +1735,11 @@ impl SoundboardApp {
                                                 ui.label(egui::RichText::new(title).strong());
 
                                                 ui.horizontal(|ui| {
-                                                    ui.label("⏱ --:--");
+                                                    if let Some(secs) = sound.duration_secs {
+                                                        ui.label(format!("⏱ {:02}:{:02}", secs / 60, secs % 60));
+                                                    } else {
+                                                        ui.label("⏱ --:--");
+                                                    }
 
                                                     let is_capturing = self
                                                         .keybind_capture
@@ -1552,7 +1807,7 @@ impl SoundboardApp {
                                                                         key
                                                                     ));
                                                                     sound.hotkey = Some(combo);
-                                                                    self.state.save();
+                                                                    sound_changed = true;
                                                                 }
                                                             }
                                                         }
@@ -1575,7 +1830,7 @@ impl SoundboardApp {
                                                                 });
                                                         } else if btn_resp.secondary_clicked() {
                                                             sound.hotkey = None;
-                                                            self.state.save();
+                                                            sound_changed = true;
                                                         }
                                                         btn_resp.on_hover_text("LMB to assign hotkey, RMB to remove");
                                                     }
@@ -1619,7 +1874,7 @@ impl SoundboardApp {
                                             if ui
                                                 .add_sized(
                                                     [56.0, 20.0],
-                                                    egui::Button::new("🎙 Mic"),
+                                                    egui::Button::new("🔊 Mic"),
                                                 )
                                                 .clicked()
                                             {
@@ -1639,7 +1894,9 @@ impl SoundboardApp {
                                                         true,
                                                         &self.state.settings.default_output,
                                                         &self.state.settings.mic_sink,
+                                                        sound.duration_secs,
                                                         self.state.settings.allow_overlap,
+                                                        self.state.settings.queue_sounds,
                                                     );
                                                 }
                                             }
@@ -1667,7 +1924,9 @@ impl SoundboardApp {
                                                         false,
                                                         &self.state.settings.default_output,
                                                         &self.state.settings.mic_sink,
+                                                        sound.duration_secs,
                                                         self.state.settings.allow_overlap,
+                                                        self.state.settings.queue_sounds,
                                                     );
                                                 }
                                             }
@@ -1678,12 +1937,13 @@ impl SoundboardApp {
                             })
                             .inner;
 
-                        let menu_content = |ui: &mut egui::Ui, app: &mut Self, s: &mut SoundEntry| {
+                        let mut menu_modified = false;
+                        let menu_content = |ui: &mut egui::Ui, app: &mut Self, s: &mut SoundEntry, mod_flag: &mut bool| {
                             ui.label("Shortcut:");
                             if s.hotkey.is_some() {
                                 if ui.button("Clear Shortcut").clicked() {
                                     s.hotkey = None;
-                                    app.state.save();
+                                    *mod_flag = true;
                                     ui.close_menu();
                                 }
                             } else {
@@ -1714,6 +1974,16 @@ impl SoundboardApp {
                             }
                             ui.separator();
 
+                            let mut cfg_changed = false;
+                            cfg_changed |= ui.checkbox(&mut s.headphones_enabled, "Local Output").changed();
+                            cfg_changed |= ui.checkbox(&mut s.mic_enabled, "Mic Output").changed();
+
+                            if cfg_changed {
+                                *mod_flag = true;
+                                app.audio.update_live_channels(s.id, s.headphones_enabled, s.mic_enabled);
+                            }
+                            ui.separator();
+
                             let mut vol_changed = ui.checkbox(&mut s.use_global_volume, "Default volume").changed();
                             
                             ui.add_enabled_ui(!s.use_global_volume, |ui| {
@@ -1730,8 +2000,8 @@ impl SoundboardApp {
                                 mic_s.on_hover_text("RMB to reset to 100%");
                             });
 
-                            if vol_changed {
-                                app.state.save();
+                            if vol_changed || cfg_changed {
+                                *mod_flag = true;
                                 let v_local = if s.use_global_volume { app.state.settings.global_volume_playback } else { s.volume_playback };
                                 let v_mic = if s.use_global_volume { app.state.settings.global_volume_out } else { s.volume_out };
                                 app.audio.update_live_volume(s.id, v_local, v_mic);
@@ -1751,10 +2021,14 @@ impl SoundboardApp {
                             }
                         };
 
-                        bg_resp.context_menu(|ui| menu_content(ui, self, sound));
-                        play_resp.context_menu(|ui| menu_content(ui, self, sound));
-                        info_resp.context_menu(|ui| menu_content(ui, self, sound));
-                        channels_resp.context_menu(|ui| menu_content(ui, self, sound));
+                        bg_resp.context_menu(|ui| menu_content(ui, self, sound, &mut menu_modified));
+                        play_resp.context_menu(|ui| menu_content(ui, self, sound, &mut menu_modified));
+                        info_resp.context_menu(|ui| menu_content(ui, self, sound, &mut menu_modified));
+                        channels_resp.context_menu(|ui| menu_content(ui, self, sound, &mut menu_modified));
+
+                        if menu_modified {
+                            sound_changed = true;
+                        }
 
                         let ctrl = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
                         let shift = ctx.input(|i| i.modifiers.shift);
@@ -1797,6 +2071,7 @@ impl SoundboardApp {
                     });
                 });
         });
+        sound_changed
     }
 
     fn truncate_name(name: &str, max_chars: usize) -> String {
@@ -1849,13 +2124,19 @@ impl eframe::App for SoundboardApp {
                         sound.mic_enabled,
                         &self.state.settings.default_output,
                         &self.state.settings.mic_sink,
+                        sound.duration_secs,
                         self.state.settings.allow_overlap,
+                        self.state.settings.queue_sounds,
                     );
                 }
             }
         }
 
-        ctx.request_repaint();
+        let is_playing = self.audio.has_active_sounds();
+        if is_playing {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+
         self.render_ui(ctx);
     }
 

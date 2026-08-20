@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 use uuid::Uuid;
 
 fn default_true() -> bool { true }
@@ -28,6 +32,8 @@ pub struct SoundEntry {
     pub custom_channels: Option<CustomChannels>,
     #[serde(default)]
     pub time_added: u64,
+    #[serde(default)]
+    pub duration_secs: Option<u64>,
     #[serde(skip)]
     pub exists: bool,
 }
@@ -50,6 +56,8 @@ pub struct AppSettings {
     pub default_output: String,
     pub mic_sink: String,
     pub allow_overlap: bool,
+    #[serde(default)]
+    pub queue_sounds: bool,
     pub mic_loopback_enabled: bool,
     pub mic_loopback_source: String,
     #[serde(default = "default_global_volume")]
@@ -89,6 +97,7 @@ impl AppState {
                 default_output: "Default".to_string(),
                 mic_sink: "Default".to_string(),
                 allow_overlap: true,
+                queue_sounds: false,
                 mic_loopback_enabled: false,
                 mic_loopback_source: "Default".to_string(),
                 global_volume_playback: 1.0,
@@ -132,8 +141,30 @@ impl AppState {
     }
 }
 
+pub fn compute_duration_fast(path: &Path) -> Option<u64> {
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .ok()?;
+
+    let format = probed.format;
+    let track = format.default_track()?;
+    let time_base = track.codec_params.time_base?;
+    let n_frames = track.codec_params.n_frames?;
+
+    let time = time_base.calc_time(n_frames);
+    Some(time.seconds)
+}
+
 fn sys_config_path() -> PathBuf {
     let mut path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
-    path.push(".config/lnx-soundboard/config.json");
+    path.push(".config/nisound/config.json");
     path
 }

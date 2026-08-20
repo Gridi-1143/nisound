@@ -8,7 +8,7 @@ use libpulse_simple_binding::Simple;
 use rodio::{Decoder, Source};
 use std::fs::File;
 use std::io::BufReader;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -16,8 +16,13 @@ use uuid::Uuid;
 pub struct PulseSink {
     stop_flag: Arc<AtomicBool>,
     finished_flag: Arc<AtomicBool>,
+    pub is_enabled: Arc<AtomicBool>,
+    pub is_paused: Arc<AtomicBool>,
+    pub is_looping: Arc<AtomicBool>,
+    pub progress_frames: Arc<AtomicU32>,
     pub volume: Arc<AtomicU32>,
     pub is_mic: bool,
+    pub sample_rate: u32,
 }
 
 impl PulseSink {
@@ -41,10 +46,25 @@ pub struct ActiveSound {
     pub sound_id: Uuid,
     pub name: String,
     pub sinks: Vec<PulseSink>,
+    pub duration_secs: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QueueItem {
+    pub queue_id: Uuid,
+    pub sound_id: Uuid,
+    pub name: String,
+    pub path: PathBuf,
+    pub headphones: bool,
+    pub mic: bool,
+    pub default_headphone_device: String,
+    pub default_mic_sink: String,
+    pub duration_secs: Option<u64>,
 }
 
 pub struct AudioEngine {
     pub active_sounds: Arc<Mutex<Vec<ActiveSound>>>,
+    pub pending_queue: Arc<Mutex<Vec<QueueItem>>>,
     pub routing_mode: Arc<Mutex<crate::config::RoutingMode>>,
     pub direct_targets: Arc<Mutex<Vec<String>>>,
 }
@@ -55,9 +75,14 @@ impl AudioEngine {
     pub fn init(routing_mode: crate::config::RoutingMode, direct_targets: Vec<String>) -> Self {
         Self {
             active_sounds: Arc::new(Mutex::new(Vec::new())),
+            pending_queue: Arc::new(Mutex::new(Vec::new())),
             routing_mode: Arc::new(Mutex::new(routing_mode)),
             direct_targets: Arc::new(Mutex::new(direct_targets)),
         }
+    }
+
+    pub fn has_active_sounds(&self) -> bool {
+        self.active_sounds.lock().map(|a| !a.is_empty()).unwrap_or(false)
     }
 
     pub fn stop_all(&self) {
@@ -68,6 +93,9 @@ impl AudioEngine {
                 }
             }
         }
+        if let Ok(mut queue) = self.pending_queue.lock() {
+            queue.clear();
+        }
     }
 
     pub fn update_live_volume(&self, sound_id: Uuid, local_vol: f32, mic_vol: f32) {
@@ -76,6 +104,43 @@ impl AudioEngine {
                 for sink in &s.sinks {
                     let v = if sink.is_mic { mic_vol } else { local_vol };
                     sink.volume.store(v.to_bits(), Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub fn update_live_channels(&self, sound_id: Uuid, headphones_enabled: bool, mic_enabled: bool) {
+        if let Ok(active) = self.active_sounds.lock() {
+            for s in active.iter().filter(|s| s.sound_id == sound_id) {
+                for sink in &s.sinks {
+                    let enabled = if sink.is_mic {
+                        mic_enabled
+                    } else {
+                        headphones_enabled
+                    };
+                    sink.is_enabled.store(enabled, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub fn toggle_pause(&self, play_id: Uuid) {
+        if let Ok(active) = self.active_sounds.lock() {
+            if let Some(sound) = active.iter().find(|s| s.play_id == play_id) {
+                for sink in &sound.sinks {
+                    let current = sink.is_paused.load(Ordering::Relaxed);
+                    sink.is_paused.store(!current, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    pub fn toggle_loop(&self, play_id: Uuid) {
+        if let Ok(active) = self.active_sounds.lock() {
+            if let Some(sound) = active.iter().find(|s| s.play_id == play_id) {
+                for sink in &sound.sinks {
+                    let current = sink.is_looping.load(Ordering::Relaxed);
+                    sink.is_looping.store(!current, Ordering::Relaxed);
                 }
             }
         }
@@ -93,29 +158,48 @@ impl AudioEngine {
         mic: bool,
         default_headphone_device: &str,
         default_mic_sink: &str,
+        duration_secs: Option<u64>,
         allow_overlap: bool,
+        queue_sounds: bool,
     ) {
         if !path.exists() {
             return;
         }
 
         if !allow_overlap {
-            self.stop_all();
+            let is_playing = !self.active_sounds.lock().unwrap().is_empty();
+            if is_playing {
+                if queue_sounds {
+                    if let Ok(mut queue) = self.pending_queue.lock() {
+                        queue.push(QueueItem {
+                            queue_id: Uuid::new_v4(),
+                            sound_id,
+                            name: name.to_string(),
+                            path: path.to_path_buf(),
+                            headphones,
+                            mic,
+                            default_headphone_device: default_headphone_device.to_string(),
+                            default_mic_sink: default_mic_sink.to_string(),
+                            duration_secs,
+                        });
+                    }
+                    return;
+                } else {
+                    self.stop_all();
+                }
+            }
         }
 
         let play_id = Uuid::new_v4();
         let mut sinks = Vec::new();
 
-        if headphones {
-            if let Some(sink) = self.spawn_sink(path, volume_playback, default_headphone_device, false) {
-                sinks.push(sink);
-            }
+        // Створюємо обидва sinks, щоб користувач міг динамічно вмикати/вимикати канали на ходу
+        if let Some(sink) = self.spawn_sink(path, volume_playback, default_headphone_device, false, headphones) {
+            sinks.push(sink);
         }
 
-        if mic {
-            if let Some(sink) = self.spawn_sink(path, volume_out, default_mic_sink, true) {
-                sinks.push(sink);
-            }
+        if let Some(sink) = self.spawn_sink(path, volume_out, default_mic_sink, true, mic) {
+            sinks.push(sink);
         }
 
         if !sinks.is_empty() {
@@ -125,12 +209,20 @@ impl AudioEngine {
                     sound_id,
                     name: name.to_string(),
                     sinks,
+                    duration_secs,
                 });
             }
         }
     }
 
-    fn spawn_sink(&self, path: &Path, initial_volume: f32, device_name: &str, is_mic: bool) -> Option<PulseSink> {
+    fn spawn_sink(
+        &self,
+        path: &Path,
+        initial_volume: f32,
+        device_name: &str,
+        is_mic: bool,
+        initially_enabled: bool,
+    ) -> Option<PulseSink> {
         let file = File::open(path).ok()?;
         let decoder = Decoder::new(BufReader::new(file)).ok()?;
 
@@ -146,8 +238,7 @@ impl AudioEngine {
             return None;
         }
 
-        let target_sink: Option<String> = if device_name.is_empty() || device_name == DEFAULT_DEVICE
-        {
+        let target_sink: Option<String> = if device_name.is_empty() || device_name == DEFAULT_DEVICE {
             None
         } else {
             Some(device_name.to_string())
@@ -177,8 +268,6 @@ impl AudioEngine {
             let _ = simple.write(&silence);
 
             if is_mic && mode == crate::config::RoutingMode::DirectTarget {
-                // Якщо вибрано DirectTarget, надсилаємо звук у nisound_mic_sink,
-                // і підключаємо монітор sink безпосередньо до обраних ID
                 move_stream_to_sink(&stream_name, "nisound_mic_sink");
                 let active_targets = crate::pipewire_routing::list_active_targets();
                 let selected: Vec<crate::pipewire_routing::PwTargetNode> = active_targets
@@ -196,21 +285,41 @@ impl AudioEngine {
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let finished_flag = Arc::new(AtomicBool::new(false));
+        let is_enabled = Arc::new(AtomicBool::new(initially_enabled));
         let volume_atomic = Arc::new(AtomicU32::new(initial_volume.to_bits()));
+        let is_paused = Arc::new(AtomicBool::new(false));
+        let is_looping = Arc::new(AtomicBool::new(false));
+        let progress_frames = Arc::new(AtomicU32::new(0));
 
         let thread_stop = stop_flag.clone();
         let thread_finished = finished_flag.clone();
+        let thread_enabled = is_enabled.clone();
         let thread_volume = volume_atomic.clone();
+        let thread_paused = is_paused.clone();
+        let thread_looping = is_looping.clone();
+        let thread_progress = progress_frames.clone();
+        let path_clone = path.to_path_buf();
 
         std::thread::spawn(move || {
-            const CHUNK_FRAMES: usize = 1024;
+            const CHUNK_FRAMES: usize = 2048;
             let chunk_samples = CHUNK_FRAMES * channels as usize;
             let mut decoder = decoder;
             let mut byte_buf: Vec<u8> = Vec::with_capacity(chunk_samples * 2);
+            let mut frames_played = 0;
 
             'outer: loop {
+                if thread_paused.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+
                 byte_buf.clear();
-                let current_vol = f32::from_bits(thread_volume.load(Ordering::Relaxed)).clamp(0.0, 2.0);
+                let channel_on = thread_enabled.load(Ordering::Relaxed);
+                let current_vol = if channel_on {
+                    f32::from_bits(thread_volume.load(Ordering::Relaxed)).clamp(0.0, 2.0)
+                } else {
+                    0.0
+                };
                 
                 for _ in 0..chunk_samples {
                     match decoder.next() {
@@ -220,12 +329,28 @@ impl AudioEngine {
                                 as i16;
                             byte_buf.extend_from_slice(&scaled.to_ne_bytes());
                         }
-                        None => break 'outer,
+                        None => {
+                            if thread_looping.load(Ordering::Relaxed) {
+                                if let Ok(file) = std::fs::File::open(&path_clone) {
+                                    if let Ok(new_dec) = rodio::Decoder::new(std::io::BufReader::new(file)) {
+                                        decoder = new_dec;
+                                        frames_played = 0;
+                                        thread_progress.store(0, Ordering::Relaxed);
+                                        continue 'outer;
+                                    }
+                                }
+                            }
+                            break 'outer;
+                        }
                     }
                     if thread_stop.load(Ordering::Relaxed) {
                         break 'outer;
                     }
                 }
+                
+                frames_played += CHUNK_FRAMES as u32;
+                thread_progress.store(frames_played, Ordering::Relaxed);
+
                 if byte_buf.is_empty() {
                     break;
                 }
@@ -246,12 +371,18 @@ impl AudioEngine {
         Some(PulseSink {
             stop_flag,
             finished_flag,
+            is_enabled,
+            is_paused,
+            is_looping,
+            progress_frames,
             volume: volume_atomic,
             is_mic,
+            sample_rate,
         })
     }
 
-    pub fn stop_sound(&self, play_id: Uuid) {
+    pub fn stop_sound(&self, play_id: Uuid, state: &crate::config::AppState) {
+        let mut trigger_queue = false;
         if let Ok(mut active) = self.active_sounds.lock() {
             if let Some(pos) = active.iter().position(|s| s.play_id == play_id) {
                 let sound = active.remove(pos);
@@ -259,12 +390,72 @@ impl AudioEngine {
                     sink.stop();
                 }
             }
+            if active.is_empty() {
+                trigger_queue = true;
+            }
+        }
+
+        if trigger_queue {
+            self.play_next_in_queue(state);
         }
     }
 
-    pub fn clean_dead_sinks(&self) {
+    pub fn play_next_in_queue(&self, state: &crate::config::AppState) {
+        let next_item = {
+            if let Ok(mut queue) = self.pending_queue.lock() {
+                if !queue.is_empty() {
+                    Some(queue.remove(0))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if let Some(item) = next_item {
+            let (v_local, v_mic) = if let Some(s) = state.sounds.get(&item.sound_id) {
+                if s.use_global_volume {
+                    (state.settings.global_volume_playback, state.settings.global_volume_out)
+                } else {
+                    (s.volume_playback, s.volume_out)
+                }
+            } else {
+                (1.0, 1.0)
+            };
+
+            self.play_sound(
+                item.sound_id,
+                &item.name,
+                &item.path,
+                v_local,
+                v_mic,
+                item.headphones,
+                item.mic,
+                &item.default_headphone_device,
+                &item.default_mic_sink,
+                item.duration_secs,
+                false,
+                true,
+            );
+        }
+    }
+
+    pub fn clean_dead_sinks(&self, state: &crate::config::AppState) {
+        let mut trigger_queue = false;
+
         if let Ok(mut active) = self.active_sounds.lock() {
-            active.retain(|s| s.sinks.iter().any(|sink| !sink.empty()));
+            if !active.is_empty() {
+                let was_playing = true;
+                active.retain(|s| s.sinks.iter().any(|sink| !sink.empty()));
+                if was_playing && active.is_empty() {
+                    trigger_queue = true;
+                }
+            }
+        }
+
+        if trigger_queue {
+            self.play_next_in_queue(state);
         }
     }
 }
