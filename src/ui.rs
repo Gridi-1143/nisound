@@ -715,8 +715,10 @@ impl SoundboardApp {
                                         to_loop = Some(*play_id);
                                     }
 
-                                    let label = Self::truncate_name(name, 26);
-                                    ui.label(egui::RichText::new(label).strong());
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(name).strong())
+                                        .truncate(true)
+                                    );
                                 });
 
                                 ui.horizontal(|ui| {
@@ -726,10 +728,10 @@ impl SoundboardApp {
                                     if let Some(total_secs) = duration {
                                         ui.label(format!("{:02}:{:02} / {:02}:{:02}", current_mins, current_secs, total_secs / 60, total_secs % 60));
                                         let ratio = (*progress_secs / (*total_secs as f32)).clamp(0.0, 1.0);
-                                        ui.add(egui::ProgressBar::new(ratio).animate(!*is_paused));
+                                        ui.add(egui::ProgressBar::new(ratio));
                                     } else {
                                         ui.label(format!("{:02}:{:02}", current_mins, current_secs));
-                                        ui.add(egui::ProgressBar::new(0.0).animate(!*is_paused));
+                                        ui.add(egui::ProgressBar::new(0.0));
                                     }
                                 });
                             });
@@ -817,8 +819,11 @@ impl SoundboardApp {
 
                                             ui.label(egui::RichText::new("☰").weak());
 
-                                            let text_label = format!("{}. {}", idx + 1, Self::truncate_name(&q_item.name, 24));
-                                            ui.label(egui::RichText::new(text_label).strong());
+                                            let text_label = format!("{}. {}", idx + 1, &q_item.name);
+                                            ui.add(
+                                                egui::Label::new(egui::RichText::new(text_label).strong())
+                                                .truncate(true)
+                                            );
                                         });
                                     });
                                 });
@@ -1729,10 +1734,11 @@ impl SoundboardApp {
                                             ui.style_mut().interaction.selectable_labels = false;
                                             ui.add_space((rect.height() - 32.0) / 2.0);
 
-                                            let title = Self::truncate_name(&sound.name, 26);
-
                                             if sound.exists {
-                                                ui.label(egui::RichText::new(title).strong());
+                                                ui.add(
+                                                    egui::Label::new(egui::RichText::new(&sound.name).strong())
+                                                    .truncate(true)
+                                                );
 
                                                 ui.horizontal(|ui| {
                                                     if let Some(secs) = sound.duration_secs {
@@ -2134,7 +2140,7 @@ impl eframe::App for SoundboardApp {
 
         let is_playing = self.audio.has_active_sounds();
         if is_playing {
-            ctx.request_repaint_after(Duration::from_millis(33));
+            ctx.request_repaint_after(Duration::from_millis(50));
         }
 
         self.render_ui(ctx);
