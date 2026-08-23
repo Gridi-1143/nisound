@@ -490,7 +490,7 @@ impl SoundboardApp {
         egui::SidePanel::right("folders")
             .resizable(true)
             .default_width(560.0)
-            .width_range(560.0..=560.0)
+            .width_range(440.0..=740.0)
             .show(ctx, |ui| {
                 let active_snapshot: Vec<(Uuid, String, bool, bool, f32, Option<u64>)> = {
                     if let Ok(active) = self.audio.active_sounds.lock() {
