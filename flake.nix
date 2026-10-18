@@ -32,6 +32,7 @@
     in {
       devShells.${system}.default = pkgs.mkShell {
         nativeBuildInputs = with pkgs; [
+          cmake
           pkg-config
           (rust-bin.stable.latest.default.override {
             extensions = [ "rust-src" "rust-analyzer" ];

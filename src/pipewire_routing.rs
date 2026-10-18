@@ -13,7 +13,6 @@ pub struct PwTargetNode {
     pub ports: Vec<PwPort>,
 }
 
-/// Перераховує активні вхідні потоки з унікальними числовими ID
 pub fn list_active_targets() -> Vec<PwTargetNode> {
     let output = match Command::new("pw-link").args(["-i", "-I"]).output() {
         Ok(out) => out,
@@ -69,7 +68,6 @@ pub fn list_active_targets() -> Vec<PwTargetNode> {
         .collect()
 }
 
-/// З'єднує вихід Nisound_Mic безпосередньо з обраним вхідним RecordStream
 pub fn link_stream_to_targets(targets: &[PwTargetNode]) {
     let output = match Command::new("pw-link").args(["-o", "-I"]).output() {
         Ok(out) => out,
@@ -109,7 +107,6 @@ pub fn link_stream_to_targets(targets: &[PwTargetNode]) {
     }
 }
 
-/// Агресивно відключає всі зв'язки Nisound від вказаної цілі
 pub fn unlink_target(target_display_name: &str) {
     let targets = list_active_targets();
     if let Some(target) = targets.iter().find(|t| t.display_name == target_display_name) {
@@ -139,7 +136,6 @@ pub fn unlink_target(target_display_name: &str) {
 
         for target_port in &target.ports {
             for src_id in &mic_out_ports {
-                // Виконуємо розрив з'єднання (-d = disconnect)
                 let _ = Command::new("pw-link")
                     .arg("-d")
                     .arg(src_id.to_string())

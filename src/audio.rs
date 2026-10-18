@@ -5,9 +5,8 @@ use pulse::proplist::Proplist;
 use pulse::sample::{Format, Spec};
 use pulse::stream::Direction;
 use libpulse_simple_binding::Simple;
-use rodio::{Decoder, Source};
+use crate::sym_decoder::SymDecoder;
 use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -193,7 +192,6 @@ impl AudioEngine {
         let play_id = Uuid::new_v4();
         let mut sinks = Vec::new();
 
-        // Створюємо обидва sinks, щоб користувач міг динамічно вмикати/вимикати канали на ходу
         if let Some(sink) = self.spawn_sink(path, volume_playback, default_headphone_device, false, headphones) {
             sinks.push(sink);
         }
@@ -223,11 +221,18 @@ impl AudioEngine {
         is_mic: bool,
         initially_enabled: bool,
     ) -> Option<PulseSink> {
-        let file = File::open(path).ok()?;
-        let decoder = Decoder::new(BufReader::new(file)).ok()?;
+        let data = std::fs::read(path).ok()?;
+        let ext = path.extension().and_then(|e| e.to_str());
+        let decoder = match SymDecoder::new(data, ext) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[nisound] decode error for {:?}: {:?}", path, e);
+                return None;
+            }
+        };
 
-        let channels = decoder.channels();
-        let sample_rate = decoder.sample_rate();
+        let channels = decoder.channels;
+        let sample_rate = decoder.sample_rate;
 
         let spec = Spec {
             format: Format::S16NE,
@@ -331,8 +336,9 @@ impl AudioEngine {
                         }
                         None => {
                             if thread_looping.load(Ordering::Relaxed) {
-                                if let Ok(file) = std::fs::File::open(&path_clone) {
-                                    if let Ok(new_dec) = rodio::Decoder::new(std::io::BufReader::new(file)) {
+                                if let Ok(data) = std::fs::read(&path_clone) {
+                                    let loop_ext = path_clone.extension().and_then(|e| e.to_str());
+                                    if let Ok(new_dec) = SymDecoder::new(data, loop_ext) {
                                         decoder = new_dec;
                                         frames_played = 0;
                                         thread_progress.store(0, Ordering::Relaxed);

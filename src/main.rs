@@ -2,7 +2,8 @@ mod config;
 mod audio;
 mod ui;
 mod pulse_devices;
-mod pipewire_routing; // NEW
+mod pipewire_routing;
+mod sym_decoder;
 
 use eframe::egui;
 use std::sync::mpsc::{Receiver, Sender};

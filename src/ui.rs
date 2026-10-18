@@ -2,13 +2,17 @@ use crate::audio::{AudioEngine, QueueItem};
 use crate::config::{AppState, Folder, SoundEntry};
 use crate::pulse_devices::{self, AudioDevice, DeviceFilter, DeviceKind};
 use egui::{Color32, Context, Ui};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
 use uuid::Uuid;
+
+const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "mp3", "wav", "ogg", "oga", "flac", "m4a", "m4b", "aac", "opus", "mp4", "webm", "mkv", "aiff", "aif"
+];
 
 #[derive(Clone, Copy, PartialEq)]
 enum SortOrder {
@@ -19,9 +23,11 @@ enum SortOrder {
 }
 
 #[derive(Clone)]
-struct FolderImportRequest {
-    source_path: PathBuf,
+struct ImportRequest {
+    source_label: String,
+    source_path: Option<PathBuf>,
     audio_paths: Vec<PathBuf>,
+    format_selection: BTreeMap<String, bool>,
 }
 
 enum PendingAction {
@@ -60,7 +66,7 @@ pub struct SoundboardApp {
     mic_filter: DeviceFilter,
     mic_channel_exists: bool,
     mic_loopback_active: bool,
-    pending_folder_import: Option<FolderImportRequest>,
+    pending_import: Option<ImportRequest>,
     active_sound_popup: Option<Uuid>,
     active_sound_popup_tab: usize,
     error_message: Option<String>,
@@ -128,7 +134,7 @@ impl SoundboardApp {
             selected_queue_id: None,
             show_settings: false,
             active_settings_tab: 0,
-            pending_folder_import: None,
+            pending_import: None,
             active_sound_popup: None,
             active_sound_popup_tab: 0,
             error_message: None,
@@ -249,10 +255,24 @@ impl SoundboardApp {
                 if ui.button("➕ Add Sound").clicked() {
                     if let Some(paths) = rfd::FileDialog::new()
                         .set_title("Select sound files")
-                        .add_filter("Audio", &["mp3", "wav", "ogg", "flac", "m4a", "aac", "opus"])
+                        .add_filter("Audio", SUPPORTED_EXTENSIONS)
                         .pick_files()
                     {
-                        self.import_sound_paths(paths, self.state.active_folder);
+                        let valid_paths: Vec<PathBuf> = paths.into_iter().filter(|p| Self::is_audio_file(p)).collect();
+                        if !valid_paths.is_empty() {
+                            let mut format_selection = BTreeMap::new();
+                            for p in &valid_paths {
+                                if let Some(ext) = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+                                    format_selection.insert(ext, true);
+                                }
+                            }
+                            self.pending_import = Some(ImportRequest {
+                                source_label: format!("{} file(s) selected", valid_paths.len()),
+                                source_path: None,
+                                audio_paths: valid_paths,
+                                format_selection,
+                            });
+                        }
                     }
                 }
 
@@ -265,9 +285,18 @@ impl SoundboardApp {
                         Self::collect_audio_files(&folder_path, &mut audio_paths);
 
                         if !audio_paths.is_empty() {
-                            self.pending_folder_import = Some(FolderImportRequest {
-                                source_path: folder_path,
+                            let mut format_selection = BTreeMap::new();
+                            for p in &audio_paths {
+                                if let Some(ext) = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+                                    format_selection.insert(ext, true);
+                                }
+                            }
+
+                            self.pending_import = Some(ImportRequest {
+                                source_label: folder_path.display().to_string(),
+                                source_path: Some(folder_path),
                                 audio_paths,
+                                format_selection,
                             });
                         }
                     }
@@ -1083,7 +1112,7 @@ impl SoundboardApp {
             }
         }
 
-        self.render_folder_import_prompt(ctx);
+        self.render_import_prompt(ctx);
         self.render_sound_popup(ctx);
         self.process_deferred_actions(ctx);
     }
@@ -1230,15 +1259,22 @@ impl SoundboardApp {
         }
     }
 
-    fn render_folder_import_prompt(&mut self, ctx: &Context) {
-        let Some(request) = self.pending_folder_import.clone() else {
+    fn render_import_prompt(&mut self, ctx: &Context) {
+        let Some(mut request) = self.pending_import.clone() else {
             return;
         };
 
         let current_folder_label = self.current_folder_label();
-        let source_label = request.source_path.display().to_string();
-        let audio_count = request.audio_paths.len();
+        let source_label = request.source_label.clone();
+        let total_audio_count = request.audio_paths.len();
         let mut open = true;
+
+        let mut format_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for p in &request.audio_paths {
+            if let Some(ext) = p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()) {
+                *format_counts.entry(ext).or_insert(0) += 1;
+            }
+        }
 
         egui::Window::new("Import folder")
             .collapsible(false)
@@ -1246,11 +1282,11 @@ impl SoundboardApp {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(format!("Folder: {}", source_label));
-                ui.label(format!("Audio files found: {}", audio_count));
+                ui.label(format!("Audio files found: {}", total_audio_count));
                 ui.separator();
 
                 if ui.button("Create new folder for these sounds").clicked() {
-                    self.finalize_folder_import(request.clone(), true);
+                    self.finalize_import(request.clone(), true);
                 }
 
                 let add_label = if self.state.active_folder.is_some() {
@@ -1260,17 +1296,94 @@ impl SoundboardApp {
                 };
 
                 if ui.button(add_label).clicked() {
-                    self.finalize_folder_import(request.clone(), false);
+                    self.finalize_import(request.clone(), false);
                 }
 
+                ui.separator();
+                ui.label("Import selected formats:");
+
+                let mut formats_changed = false;
+                let available_width = ui.available_width();
+                let col_width = 110.0;
+                let cols = ((available_width / col_width).floor() as usize).max(2);
+
+                egui::Grid::new("import_formats_grid")
+                    .num_columns(cols)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        let mut col = 0;
+                        for (ext, count) in &format_counts {
+                            let is_checked = request.format_selection.entry(ext.clone()).or_insert(true);
+                            let label = format!("{} ({})", ext, count);
+                            if ui.checkbox(is_checked, label).changed() {
+                                formats_changed = true;
+                            }
+                            col += 1;
+                            if col >= cols {
+                                col = 0;
+                                ui.end_row();
+                            }
+                        }
+                    });
+
+                if formats_changed {
+                    self.pending_import = Some(request.clone());
+                }
+
+                ui.separator();
+
                 if ui.button("Cancel").clicked() {
-                    self.pending_folder_import = None;
+                    self.pending_import = None;
                 }
             });
 
         if !open {
-            self.pending_folder_import = None;
+            self.pending_import = None;
         }
+    }
+
+    fn finalize_import(&mut self, request: ImportRequest, create_new_folder: bool) {
+        let filtered_paths: Vec<PathBuf> = request
+            .audio_paths
+            .into_iter()
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_ascii_lowercase())
+                    .and_then(|e| request.format_selection.get(&e).copied())
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        if filtered_paths.is_empty() {
+            self.pending_import = None;
+            return;
+        }
+
+        let target_folder = if create_new_folder {
+            let folder_name = request
+                .source_path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "Imported Sounds".to_string());
+
+            let folder_id = Uuid::new_v4();
+            self.state.folders.push(Folder {
+                id: folder_id,
+                name: folder_name,
+                sound_ids: vec![],
+            });
+            self.state.active_folder = Some(folder_id);
+            Some(folder_id)
+        } else {
+            self.state.active_folder
+        };
+
+        self.import_sound_paths(filtered_paths, target_folder);
+        self.pending_import = None;
+        self.state.save();
     }
 
     fn render_sound_popup(&mut self, ctx: &Context) {
@@ -1475,32 +1588,6 @@ impl SoundboardApp {
         }
     }
 
-    fn finalize_folder_import(&mut self, request: FolderImportRequest, create_new_folder: bool) {
-        let target_folder = if create_new_folder {
-            let folder_name = request
-                .source_path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| "Imported Sounds".to_string());
-
-            let folder_id = Uuid::new_v4();
-            self.state.folders.push(Folder {
-                id: folder_id,
-                name: folder_name,
-                sound_ids: vec![],
-            });
-            self.state.active_folder = Some(folder_id);
-            Some(folder_id)
-        } else {
-            self.state.active_folder
-        };
-
-        self.import_sound_paths(request.audio_paths, target_folder);
-        self.pending_folder_import = None;
-        self.state.save();
-    }
-
     fn import_sound_paths(&mut self, paths: Vec<PathBuf>, target_folder: Option<Uuid>) {
         let mut skipped = 0;
         for path in paths {
@@ -1610,10 +1697,8 @@ impl SoundboardApp {
         path.extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| {
-                matches!(
-                    ext.to_ascii_lowercase().as_str(),
-                    "mp3" | "wav" | "ogg" | "flac" | "m4a" | "aac" | "opus" | "webm"
-                )
+                let ext_clean = ext.to_ascii_lowercase();
+                SUPPORTED_EXTENSIONS.contains(&ext_clean.as_str())
             })
             .unwrap_or(false)
     }
