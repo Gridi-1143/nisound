@@ -1,7 +1,7 @@
 use crate::audio::{AudioEngine, QueueItem};
-use crate::config::{AppState, Folder, SoundEntry};
+use crate::config::{hex_to_rgb, rgb_to_hex, AppState, Folder, SoundEntry};
 use crate::pulse_devices::{self, AudioDevice, DeviceFilter, DeviceKind};
-use egui::{Color32, Context, Ui};
+use egui::{epaint::Shadow, Color32, Context, Stroke, Ui, Visuals};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -82,6 +82,7 @@ pub struct SoundboardApp {
     dragged_queue_index: Option<usize>,
     metadata_tx: Sender<(Uuid, PathBuf)>,
     metadata_rx: Receiver<(Uuid, Option<u64>)>,
+    hex_inputs: BTreeMap<String, String>,
 }
 
 impl SoundboardApp {
@@ -150,6 +151,7 @@ impl SoundboardApp {
             dragged_queue_index: None,
             metadata_tx: task_tx,
             metadata_rx: res_rx,
+            hex_inputs: BTreeMap::new(),
         }
     }
 
@@ -175,6 +177,60 @@ impl SoundboardApp {
             .find(|d| d.name == name)
             .map(|d| d.description.as_str())
             .unwrap_or(name)
+    }
+
+    fn color_from_key(&self, key: &str, fallback: [u8; 3]) -> Color32 {
+        let rgb = self.state.settings.colors.get(key).copied().unwrap_or(fallback);
+        Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+    }
+
+    pub fn apply_custom_theme(&self, ctx: &Context) {
+        let bg = self.color_from_key("Background", [24, 24, 32]);
+        let panels = self.color_from_key("Panels", [30, 30, 42]);
+        let btn_norm = self.color_from_key("Button Normal", [48, 52, 70]);
+        let btn_hover = self.color_from_key("Button Hovered", [62, 68, 92]);
+        let btn_act = self.color_from_key("Button Active", [78, 86, 116]);
+        let text = self.color_from_key("Text", [230, 230, 240]);
+        let accent = self.color_from_key("Accent / Selection", [137, 180, 250]);
+        let border = self.color_from_key("Borders", [55, 58, 76]);
+        let win_bg = self.color_from_key("Window Background", [32, 34, 46]);
+
+        let mut visuals = Visuals::dark();
+        visuals.panel_fill = panels;
+        visuals.window_fill = win_bg;
+        visuals.faint_bg_color = bg;
+        visuals.extreme_bg_color = bg;
+
+        visuals.widgets.noninteractive.bg_fill = panels;
+        visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
+
+        visuals.widgets.inactive.bg_fill = btn_norm;
+        visuals.widgets.inactive.weak_bg_fill = btn_norm;
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text);
+        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, border);
+
+        visuals.widgets.hovered.bg_fill = btn_hover;
+        visuals.widgets.hovered.weak_bg_fill = btn_hover;
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
+        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
+
+        visuals.widgets.active.bg_fill = btn_act;
+        visuals.widgets.active.weak_bg_fill = btn_act;
+        visuals.widgets.active.fg_stroke = Stroke::new(1.0, text);
+        visuals.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+
+        visuals.widgets.open.bg_fill = btn_hover;
+        visuals.widgets.open.weak_bg_fill = btn_hover;
+        visuals.widgets.open.fg_stroke = Stroke::new(1.0, text);
+
+        visuals.selection.bg_fill = accent;
+        visuals.selection.stroke = Stroke::new(1.0, text);
+
+        visuals.window_stroke = Stroke::new(1.0, border);
+        visuals.window_shadow = Shadow::NONE;
+
+        ctx.set_visuals(visuals);
     }
 
     fn execute_action(&mut self, action: PendingAction) {
@@ -214,6 +270,8 @@ impl SoundboardApp {
     }
 
     pub fn render_ui(&mut self, ctx: &Context) {
+        self.apply_custom_theme(ctx);
+
         let mut save_needed = false;
         while let Ok((id, dur)) = self.metadata_rx.try_recv() {
             if let Some(sound) = self.state.sounds.get_mut(&id) {
@@ -249,10 +307,12 @@ impl SoundboardApp {
             }
         }
 
+        let btn_normal = self.color_from_key("Button Normal", [48, 52, 70]);
+
         // ── TOP TOOLBAR ──────────────────────────────────────────────────────
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("➕ Add Sound").clicked() {
+                if ui.add(egui::Button::new("➕ Add Sound").fill(btn_normal)).clicked() {
                     if let Some(paths) = rfd::FileDialog::new()
                         .set_title("Select sound files")
                         .add_filter("Audio", SUPPORTED_EXTENSIONS)
@@ -276,7 +336,7 @@ impl SoundboardApp {
                     }
                 }
 
-                if ui.button("📁 Add Folder").clicked() {
+                if ui.add(egui::Button::new("📁 Add Folder").fill(btn_normal)).clicked() {
                     if let Some(folder_path) = rfd::FileDialog::new()
                         .set_title("Select folder with sounds")
                         .pick_folder()
@@ -304,7 +364,7 @@ impl SoundboardApp {
 
                 ui.separator();
 
-                if ui.button("🔄").on_hover_text("Refresh device list").clicked() {
+                if ui.add(egui::Button::new("🔄").fill(btn_normal)).on_hover_text("Refresh device list").clicked() {
                     self.refresh_devices();
                     self.refresh_mic_channel_status();
                 }
@@ -509,7 +569,7 @@ impl SoundboardApp {
                 }
 
                 ui.separator();
-                if ui.button("⚙ Settings").clicked() {
+                if ui.add(egui::Button::new("⚙ Settings").fill(btn_normal)).clicked() {
                     self.show_settings = !self.show_settings;
                 }
             });
@@ -652,7 +712,7 @@ impl SoundboardApp {
                     ui.horizontal(|ui| {
                         ui.heading("Playback");
                         
-                        if ui.button("⏹ Stop All").clicked() {
+                        if ui.add(egui::Button::new("⏹ Stop All").fill(btn_normal)).clicked() {
                             self.audio.stop_all();
                         }
 
@@ -700,7 +760,7 @@ impl SoundboardApp {
                                 Some(hk) => format!("⌨ {}", hk),
                                 None => "➕ Hotkey".to_string(),
                             };
-                            let btn_resp = ui.small_button(&btn_text);
+                            let btn_resp = ui.add(egui::Button::new(&btn_text).fill(btn_normal));
                             if btn_resp.clicked() {
                                 let mods = ctx.input(|i| i.modifiers);
                                 self.keybind_capture = Some(KeybindCapture {
@@ -720,7 +780,7 @@ impl SoundboardApp {
                     ui.separator();
 
                     if active_snapshot.is_empty() && queued_snapshot.is_empty() {
-                        ui.weak("Nothing playing");
+                        ui.label("Nothing playing");
                     } else {
                         let mut to_stop: Option<Uuid> = None;
                         let mut to_pause: Option<Uuid> = None;
@@ -735,12 +795,12 @@ impl SoundboardApp {
                                     }
                                     
                                     let pause_icon = if *is_paused { "▶" } else { "⏸" };
-                                    if ui.add_sized([22.0, 22.0], egui::Button::new(pause_icon)).clicked() {
+                                    if ui.add_sized([22.0, 22.0], egui::Button::new(pause_icon).fill(btn_normal)).clicked() {
                                         to_pause = Some(*play_id);
                                     }
                                     
                                     let loop_color = if *is_looping { Color32::GREEN } else { Color32::GRAY };
-                                    if ui.add_sized([22.0, 22.0], egui::Button::new(egui::RichText::new("🔁").color(loop_color))).on_hover_text("Loop sound").clicked() {
+                                    if ui.add_sized([22.0, 22.0], egui::Button::new(egui::RichText::new("🔁").color(loop_color)).fill(btn_normal)).on_hover_text("Loop sound").clicked() {
                                         to_loop = Some(*play_id);
                                     }
 
@@ -784,16 +844,19 @@ impl SoundboardApp {
                             let mut queue_modified = false;
                             let mut delete_queue_id: Option<Uuid> = None;
 
+                            let card_bg = self.color_from_key("Card Background", [42, 42, 56]);
+                            let card_selected = self.color_from_key("Card Selected", [60, 80, 130]);
+
                             for (idx, q_item) in queued_snapshot.iter().enumerate() {
                                 let is_selected = self.selected_queue_id == Some(q_item.queue_id);
                                 let is_being_dragged = self.dragged_queue_index == Some(idx);
                                 
                                 let frame_color = if is_being_dragged {
-                                    Color32::from_rgb(90, 110, 160)
+                                    card_selected.linear_multiply(1.2)
                                 } else if is_selected {
-                                    Color32::from_rgb(70, 90, 140)
+                                    card_selected
                                 } else {
-                                    Color32::from_rgb(38, 38, 48)
+                                    card_bg
                                 };
 
                                 let frame = egui::Frame::none()
@@ -846,7 +909,7 @@ impl SoundboardApp {
                                                 delete_queue_id = Some(q_item.queue_id);
                                             }
 
-                                            ui.label(egui::RichText::new("☰").weak());
+                                            ui.label("☰");
 
                                             let text_label = format!("{}. {}", idx + 1, &q_item.name);
                                             ui.add(
@@ -1037,7 +1100,7 @@ impl SoundboardApp {
                         0 => {
                             ui.label("Audio devices");
 
-                            if ui.button("🔄 Update device list").clicked() {
+                            if ui.add(egui::Button::new("🔄 Update device list").fill(btn_normal)).clicked() {
                                 want_refresh_devices = true;
                             }
 
@@ -1082,20 +1145,55 @@ impl SoundboardApp {
                             };
                             ui.horizontal(|ui| {
                                 ui.label(status_text);
-                                if ui.small_button("🔄").on_hover_text("Refresh status").clicked() {
+                                if ui.add(egui::Button::new("🔄").fill(btn_normal)).on_hover_text("Refresh status").clicked() {
                                     want_refresh_mic_status = true;
                                 }
                             });
                         }
                         1 => {
-                            ui.label("Theme Color Editor");
+                            ui.horizontal(|ui| {
+                                ui.heading("Theme Color Editor");
+                                if ui.add(egui::Button::new("↺ Reset to Defaults").fill(btn_normal)).clicked() {
+                                    self.state.settings.colors = AppState::default_colors();
+                                    self.hex_inputs.clear();
+                                    self.state.save();
+                                }
+                            });
+                            ui.separator();
+
                             let mut changed = false;
-                            for (key, color) in self.state.settings.colors.iter_mut() {
-                                ui.horizontal(|ui| {
-                                    ui.label(key);
-                                    changed |= ui.color_edit_button_srgb(color).changed();
+                            let mut sorted_keys: Vec<String> = self.state.settings.colors.keys().cloned().collect();
+                            sorted_keys.sort();
+
+                            egui::Grid::new("colors_editor_grid")
+                                .num_columns(3)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    for key in sorted_keys {
+                                        ui.label(&key);
+                                        if let Some(color) = self.state.settings.colors.get_mut(&key) {
+                                            if ui.color_edit_button_srgb(color).changed() {
+                                                changed = true;
+                                                self.hex_inputs.insert(key.clone(), rgb_to_hex(*color));
+                                            }
+
+                                            let hex_entry = self
+                                                .hex_inputs
+                                                .entry(key.clone())
+                                                .or_insert_with(|| rgb_to_hex(*color));
+
+                                            let response = ui.add_sized([80.0, 20.0], egui::TextEdit::singleline(hex_entry));
+                                            if response.changed() {
+                                                if let Some(parsed) = hex_to_rgb(hex_entry) {
+                                                    *color = parsed;
+                                                    changed = true;
+                                                }
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
                                 });
-                            }
+
                             if changed {
                                 self.state.save();
                             }
@@ -1118,6 +1216,8 @@ impl SoundboardApp {
     }
 
     fn process_deferred_actions(&mut self, ctx: &Context) {
+        let btn_normal = self.color_from_key("Button Normal", [48, 52, 70]);
+
         if !self.action_remove_sounds_from_folder.is_empty() {
             if let Some(folder_id) = self.state.active_folder {
                 if let Some(f) = self.state.folders.iter_mut().find(|f| f.id == folder_id) {
@@ -1166,12 +1266,12 @@ impl SoundboardApp {
                 .show(ctx, |ui| {
                     ui.label("Are you sure? This action cannot be undone.");
                     ui.horizontal(|ui| {
-                        if ui.button("Yes").clicked() {
+                        if ui.add(egui::Button::new("Yes").fill(btn_normal)).clicked() {
                             if let Some(action_to_run) = self.confirm_action.take() {
                                 self.execute_action(action_to_run);
                             }
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.add(egui::Button::new("Cancel").fill(btn_normal)).clicked() {
                             self.confirm_action = None;
                         }
                     });
@@ -1212,7 +1312,7 @@ impl SoundboardApp {
                     });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("Create").clicked() {
+                        if ui.add(egui::Button::new("Create").fill(btn_normal)).clicked() {
                             if !self.new_folder_name.trim().is_empty() {
                                 self.state.folders.push(Folder {
                                     id: Uuid::new_v4(),
@@ -1224,7 +1324,7 @@ impl SoundboardApp {
                             self.new_folder_name.clear();
                             self.show_new_folder_dialog = false;
                         }
-                        if ui.button("Cancel").clicked() {
+                        if ui.add(egui::Button::new("Cancel").fill(btn_normal)).clicked() {
                             self.show_new_folder_dialog = false;
                             self.new_folder_name.clear();
                         }
@@ -1245,7 +1345,7 @@ impl SoundboardApp {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.label(err);
-                    if ui.button("OK").clicked() {
+                    if ui.add(egui::Button::new("OK").fill(btn_normal)).clicked() {
                         clear_error = true;
                     }
                 });
@@ -1264,6 +1364,7 @@ impl SoundboardApp {
             return;
         };
 
+        let btn_normal = self.color_from_key("Button Normal", [48, 52, 70]);
         let current_folder_label = self.current_folder_label();
         let source_label = request.source_label.clone();
         let total_audio_count = request.audio_paths.len();
@@ -1285,7 +1386,7 @@ impl SoundboardApp {
                 ui.label(format!("Audio files found: {}", total_audio_count));
                 ui.separator();
 
-                if ui.button("Create new folder for these sounds").clicked() {
+                if ui.add(egui::Button::new("Create new folder for these sounds").fill(btn_normal)).clicked() {
                     self.finalize_import(request.clone(), true);
                 }
 
@@ -1295,7 +1396,7 @@ impl SoundboardApp {
                     "Add to All Sounds".to_string()
                 };
 
-                if ui.button(add_label).clicked() {
+                if ui.add(egui::Button::new(add_label).fill(btn_normal)).clicked() {
                     self.finalize_import(request.clone(), false);
                 }
 
@@ -1332,7 +1433,7 @@ impl SoundboardApp {
 
                 ui.separator();
 
-                if ui.button("Cancel").clicked() {
+                if ui.add(egui::Button::new("Cancel").fill(btn_normal)).clicked() {
                     self.pending_import = None;
                 }
             });
@@ -1396,6 +1497,7 @@ impl SoundboardApp {
             return;
         };
 
+        let btn_normal = self.color_from_key("Button Normal", [48, 52, 70]);
         let mut open = true;
 
         let sound_clone = self.state.sounds.get(&sound_id).cloned();
@@ -1426,8 +1528,7 @@ impl SoundboardApp {
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new(Self::truncate_name(&path_str, 40))
-                                                .monospace()
-                                                .weak(),
+                                                .monospace(),
                                         )
                                         .sense(egui::Sense::hover()),
                                     )
@@ -1457,7 +1558,7 @@ impl SoundboardApp {
                                             preview.push_str("...");
 
                                             ui.colored_label(Color32::YELLOW, &preview);
-                                            ui.weak("(press key, Esc to cancel)");
+                                            ui.label("(press key, Esc to cancel)");
 
                                             let events = ctx.input(|i| i.events.clone());
                                             let mods = ctx.input(|i| i.modifiers);
@@ -1489,7 +1590,7 @@ impl SoundboardApp {
                                                 Some(hk) => format!("⌨ {}", hk),
                                                 None => "➕Assign hotkey".to_string(),
                                             };
-                                            let btn_resp = ui.small_button(&btn_text);
+                                            let btn_resp = ui.add(egui::Button::new(&btn_text).fill(btn_normal));
                                             if btn_resp.clicked() {
                                                 let mods = ctx.input(|i| i.modifiers);
                                                 self.keybind_capture = Some(KeybindCapture {
@@ -1714,12 +1815,17 @@ impl SoundboardApp {
         ui.push_id(("sound_card", sound.id), |ui| {
             let is_selected = self.selected_sounds.contains(&sound.id);
 
+            let card_bg = self.color_from_key("Card Background", [42, 42, 56]);
+            let card_selected = self.color_from_key("Card Selected", [60, 80, 130]);
+            let card_missing = self.color_from_key("Card Missing File", [120, 45, 45]);
+            let btn_normal = self.color_from_key("Button Normal", [48, 52, 70]);
+
             let frame_color = if !sound.exists {
-                Color32::from_rgb(180, 82, 82)
+                card_missing
             } else if is_selected {
-                Color32::from_rgb(70, 90, 140)
+                card_selected
             } else {
-                Color32::from_rgb(45, 45, 56)
+                card_bg
             };
 
             egui::Frame::none()
@@ -1771,7 +1877,7 @@ impl SoundboardApp {
                                             ui.add_space((rect.height() - 28.0) / 2.0);
                                             let play_btn = ui.add_sized(
                                                 [40.0, 28.0],
-                                                egui::Button::new("▶"),
+                                                egui::Button::new("▶").fill(btn_normal),
                                             );
                                             if play_btn.clicked() {
                                                 let ctrl = ctx.input(|i| {
@@ -1907,7 +2013,7 @@ impl SoundboardApp {
                                                             Some(hk) => format!("⌨ {}", hk),
                                                             None => "➕".to_string(),
                                                         };
-                                                        let btn_resp = ui.small_button(&btn_text);
+                                                        let btn_resp = ui.add(egui::Button::new(&btn_text).fill(btn_normal));
                                                         if btn_resp.clicked() {
                                                             let mods =
                                                                 ctx.input(|i| i.modifiers);
@@ -1962,13 +2068,13 @@ impl SoundboardApp {
                                         |ui| {
                                             ui.add_space((rect.height() - 44.0) / 2.0);
 
-                                            if ui
-                                                .add_sized(
-                                                    [56.0, 20.0],
-                                                    egui::Button::new("🔊 Mic"),
-                                                )
-                                                .clicked()
-                                            {
+                                            let mic_fill = if sound.mic_enabled {
+                                                btn_normal
+                                            } else {
+                                                btn_normal.linear_multiply(0.4)
+                                            };
+
+                                            if ui.add_sized([56.0, 20.0], egui::Button::new("🔊 Mic").fill(mic_fill)).clicked() {
                                                 let ctrl = ctx.input(|i| {
                                                     i.modifiers.command || i.modifiers.ctrl
                                                 });
@@ -1992,13 +2098,13 @@ impl SoundboardApp {
                                                 }
                                             }
 
-                                            if ui
-                                                .add_sized(
-                                                    [56.0, 20.0],
-                                                    egui::Button::new("🎧 Local"),
-                                                )
-                                                .clicked()
-                                            {
+                                            let local_fill = if sound.headphones_enabled {
+                                                btn_normal
+                                            } else {
+                                                btn_normal.linear_multiply(0.4)
+                                            };
+
+                                            if ui.add_sized([56.0, 20.0], egui::Button::new("🎧 Local").fill(local_fill)).clicked() {
                                                 let ctrl = ctx.input(|i| {
                                                     i.modifiers.command || i.modifiers.ctrl
                                                 });
@@ -2038,7 +2144,7 @@ impl SoundboardApp {
                                     ui.close_menu();
                                 }
                             } else {
-                                ui.weak("No shortcut assigned");
+                                ui.label("No shortcut assigned");
                             }
                             ui.separator();
 

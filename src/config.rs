@@ -84,11 +84,31 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new_empty() -> Self {
+    pub fn default_colors() -> HashMap<String, [u8; 3]> {
         let mut colors = HashMap::new();
-        colors.insert("bg".to_string(), [30, 30, 46]);
-        colors.insert("accent".to_string(), [137, 180, 250]);
+        colors.insert("Background".to_string(), [30, 36, 48]);
+        colors.insert("Panels".to_string(), [30, 36, 48]);
+        colors.insert("Card Background".to_string(), [25, 33, 45]);
+        colors.insert("Card Missing File".to_string(), [100, 60, 60]);
+        colors.insert("Card Selected".to_string(), [57, 80, 109]);
+        colors.insert("Button Normal".to_string(), [33, 45, 63]);
+        colors.insert("Button Hovered".to_string(), [33, 45, 63]);
+        colors.insert("Button Active".to_string(), [57, 80, 109]);
+        colors.insert("Text".to_string(), [205, 206, 207]);
+        colors.insert("Accent / Selection".to_string(), [57, 80, 109]);
+        colors.insert("Borders".to_string(), [43, 59, 81]);
+        colors.insert("Window Background".to_string(), [30, 36, 48]);
+        colors
+    }
 
+    pub fn ensure_default_colors(&mut self) {
+        let defaults = Self::default_colors();
+        for (k, v) in defaults {
+            self.settings.colors.entry(k).or_insert(v);
+        }
+    }
+
+    pub fn new_empty() -> Self {
         Self {
             sounds: HashMap::new(),
             folders: vec![],
@@ -105,7 +125,7 @@ impl AppState {
                 routing_mode: RoutingMode::DirectTarget,
                 direct_targets: Vec::new(),
                 stop_all_hotkey: None,
-                colors,
+                colors: Self::default_colors(),
             },
         }
     }
@@ -121,6 +141,7 @@ impl AppState {
             Self::new_empty()
         };
 
+        state.ensure_default_colors();
         state.validate_and_index();
         state
     }
@@ -139,6 +160,21 @@ impl AppState {
             sound.exists = sound.path.exists();
         }
     }
+}
+
+pub fn rgb_to_hex(rgb: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+pub fn hex_to_rgb(hex: &str) -> Option<[u8; 3]> {
+    let clean = hex.trim().trim_start_matches('#');
+    if clean.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&clean[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&clean[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&clean[4..6], 16).ok()?;
+    Some([r, g, b])
 }
 
 pub fn compute_duration_fast(path: &Path) -> Option<u64> {
