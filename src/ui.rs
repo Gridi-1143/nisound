@@ -2182,44 +2182,72 @@ impl SoundboardApp {
 
 impl eframe::App for SoundboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.keybind_capture.is_some() {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| !matches!(e, egui::Event::Key { .. }));
+            });
+            ctx.request_repaint_after(Duration::from_millis(30));
+        }
+
+        let mut incoming: Vec<String> = Vec::new();
         if let Some(rx) = &self.hotkey_rx {
             while let Ok(crate::GlobalEvent::HotkeyTriggered(key_str)) = rx.try_recv() {
-                let mut stopped_all = false;
-                
-                if let Some(hk) = &self.state.settings.stop_all_hotkey {
-                    if hk == &key_str {
-                        self.audio.stop_all();
-                        stopped_all = true;
-                    }
-                }
+                incoming.push(key_str);
+            }
+        }
 
-                if stopped_all {
+        for key_str in incoming {
+            if let Some(cap) = self.keybind_capture.clone() {
+                let key_only = key_str.rsplit('+').next().unwrap_or("");
+                if key_only == "Escape" {
+                    self.keybind_capture = None;
+                } else {
+                    match cap.target {
+                        KeybindTarget::Sound(id) => {
+                            if let Some(s) = self.state.sounds.get_mut(&id) {
+                                s.hotkey = Some(key_str.clone());
+                            }
+                        }
+                        KeybindTarget::StopAll => {
+                            self.state.settings.stop_all_hotkey = Some(key_str.clone());
+                        }
+                    }
+                    self.state.save();
+                    self.keybind_capture = None;
+                }
+                continue;
+            }
+
+            if let Some(hk) = &self.state.settings.stop_all_hotkey {
+                if hk == &key_str {
+                    self.audio.stop_all();
                     continue;
                 }
+            }
 
-                let sound_to_play = self.state.sounds.values().find(|s| {
-                    s.hotkey.as_deref().map(|hk| {
-                        hk == &key_str
-                    }).unwrap_or(false)
-                }).cloned();
+            let sound_to_play = self
+                .state
+                .sounds
+                .values()
+                .find(|s| s.hotkey.as_deref() == Some(key_str.as_str()))
+                .cloned();
 
-                if let Some(sound) = sound_to_play {
-                    let (v_local, v_mic) = self.get_effective_volume(&sound);
-                    self.audio.play_sound(
-                        sound.id,
-                        &sound.name,
-                        &sound.path,
-                        v_local,
-                        v_mic,
-                        sound.headphones_enabled,
-                        sound.mic_enabled,
-                        &self.state.settings.default_output,
-                        &self.state.settings.mic_sink,
-                        sound.duration_secs,
-                        self.state.settings.allow_overlap,
-                        self.state.settings.queue_sounds,
-                    );
-                }
+            if let Some(sound) = sound_to_play {
+                let (v_local, v_mic) = self.get_effective_volume(&sound);
+                self.audio.play_sound(
+                    sound.id,
+                    &sound.name,
+                    &sound.path,
+                    v_local,
+                    v_mic,
+                    sound.headphones_enabled,
+                    sound.mic_enabled,
+                    &self.state.settings.default_output,
+                    &self.state.settings.mic_sink,
+                    sound.duration_secs,
+                    self.state.settings.allow_overlap,
+                    self.state.settings.queue_sounds,
+                );
             }
         }
 
