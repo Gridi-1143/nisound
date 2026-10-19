@@ -337,7 +337,52 @@ impl SoundboardApp {
         self.audio.clean_dead_sinks(&self.state);
 
         if ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            if let Some(sound_id) = self.last_selected_sound {
+            let ctrl = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
+
+            if ctrl {
+                let mut selected_vec: Vec<Uuid> = if !self.selected_sounds.is_empty() {
+                    self.selected_sounds.iter().cloned().collect()
+                } else if let Some(id) = self.last_selected_sound {
+                    vec![id]
+                } else {
+                    Vec::new()
+                };
+
+                selected_vec.sort_by(|a, b| {
+                    let s_a = self.state.sounds.get(a);
+                    let s_b = self.state.sounds.get(b);
+                    if let (Some(sa), Some(sb)) = (s_a, s_b) {
+                        match self.sort_order {
+                            SortOrder::TimeAsc => sa.time_added.cmp(&sb.time_added),
+                            SortOrder::TimeDesc => sb.time_added.cmp(&sa.time_added),
+                            SortOrder::AlphaAsc => sa.name.to_lowercase().cmp(&sb.name.to_lowercase()),
+                            SortOrder::AlphaDesc => sb.name.to_lowercase().cmp(&sa.name.to_lowercase()),
+                        }
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                });
+
+                for sound_id in selected_vec {
+                    if let Some(sound) = self.state.sounds.get(&sound_id) {
+                        let (v_local, v_mic) = self.get_effective_volume(sound);
+                        self.audio.play_sound(
+                            sound.id,
+                            &sound.name,
+                            &sound.path,
+                            v_local,
+                            v_mic,
+                            sound.headphones_enabled,
+                            sound.mic_enabled,
+                            &self.state.settings.default_output,
+                            &self.state.settings.mic_sink,
+                            sound.duration_secs,
+                            false,
+                            true,
+                        );
+                    }
+                }
+            } else if let Some(sound_id) = self.last_selected_sound {
                 if let Some(sound) = self.state.sounds.get(&sound_id) {
                     let (v_local, v_mic) = self.get_effective_volume(sound);
                     self.audio.play_sound(
@@ -627,6 +672,9 @@ impl SoundboardApp {
         });
 
         // ── RIGHT PANEL: Categories + Playback ──────────────────────────────
+        let btn_missing = self.color_from_key("Card Missing File", [100, 60, 60]);
+        let btn_active = self.color_from_key("Button Active", [78, 86, 116]);
+        let text = self.color_from_key("Text", [230, 230, 240]);
         egui::SidePanel::right("folders")
             .resizable(true)
             .default_width(560.0)
@@ -861,7 +909,7 @@ impl SoundboardApp {
                             ui.group(|ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    if ui.add_sized([22.0, 22.0], egui::Button::new("X").fill(Color32::from_rgb(160, 60, 60))).clicked() {
+                                    if ui.add_sized([22.0, 22.0], egui::Button::new("X").fill(btn_missing)).clicked() {
                                         to_stop = Some(*play_id);
                                     }
                                     
@@ -870,7 +918,7 @@ impl SoundboardApp {
                                         to_pause = Some(*play_id);
                                     }
                                     
-                                    let loop_color = if *is_looping { Color32::GREEN } else { Color32::GRAY };
+                                    let loop_color = if *is_looping { btn_active } else { text };
                                     if ui.add_sized([22.0, 22.0], egui::Button::new(egui::RichText::new("🔁").color(loop_color)).fill(btn_normal)).on_hover_text("Loop sound").clicked() {
                                         to_loop = Some(*play_id);
                                     }
@@ -974,7 +1022,7 @@ impl SoundboardApp {
                                         ui.horizontal(|ui| {
                                             let del_resp = ui.add_sized(
                                                 [20.0, 20.0],
-                                                egui::Button::new("X").fill(Color32::from_rgb(150, 50, 50))
+                                                egui::Button::new("X").fill(btn_normal)
                                             );
                                             if del_resp.clicked() {
                                                 delete_queue_id = Some(q_item.queue_id);

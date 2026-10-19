@@ -75,12 +75,27 @@ pub struct AppSettings {
     pub colors: HashMap<String, [u8; 3]>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Clone, Debug)]
 pub struct AppState {
     pub sounds: HashMap<Uuid, SoundEntry>,
     pub folders: Vec<Folder>,
     pub active_folder: Option<Uuid>,
     pub settings: AppSettings,
+}
+
+#[derive(Serialize, Deserialize)]
+struct GeneralConfig {
+    pub settings: AppSettings,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SoundsConfig {
+    #[serde(default)]
+    pub folders: Vec<Folder>,
+    #[serde(default)]
+    pub active_folder: Option<Uuid>,
+    #[serde(default)]
+    pub sounds: HashMap<Uuid, SoundEntry>,
 }
 
 impl AppState {
@@ -132,15 +147,29 @@ impl AppState {
     }
 
     pub fn load_or_create() -> Self {
-        let config_path = sys_config_path();
-        let mut state = if config_path.exists() {
-            std::fs::read_to_string(config_path)
-                .ok()
-                .and_then(|json| serde_json::from_str::<AppState>(&json).ok())
-                .unwrap_or_else(Self::new_empty)
-        } else {
-            Self::new_empty()
-        };
+        let dir = config_dir();
+        let toml_file = dir.join("config.toml");
+        let sounds_file = dir.join("sounds.json");
+
+        let mut state = Self::new_empty();
+
+        if toml_file.exists() {
+            if let Ok(toml_str) = std::fs::read_to_string(&toml_file) {
+                if let Ok(gen_cfg) = toml::from_str::<GeneralConfig>(&toml_str) {
+                    state.settings = gen_cfg.settings;
+                }
+            }
+        }
+
+        if sounds_file.exists() {
+            if let Ok(json_str) = std::fs::read_to_string(&sounds_file) {
+                if let Ok(sounds_cfg) = serde_json::from_str::<SoundsConfig>(&json_str) {
+                    state.folders = sounds_cfg.folders;
+                    state.active_folder = sounds_cfg.active_folder;
+                    state.sounds = sounds_cfg.sounds;
+                }
+            }
+        }
 
         state.ensure_default_colors();
         state.validate_and_index();
@@ -148,11 +177,25 @@ impl AppState {
     }
 
     pub fn save(&self) {
-        if let Some(parent) = sys_config_path().parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let dir = config_dir();
+        let _ = std::fs::create_dir_all(&dir);
+
+        let gen_cfg = GeneralConfig {
+            settings: self.settings.clone(),
+        };
+
+        if let Ok(toml_str) = toml::to_string_pretty(&gen_cfg) {
+            let _ = std::fs::write(dir.join("config.toml"), toml_str);
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(sys_config_path(), json);
+
+        let sounds_cfg = SoundsConfig {
+            folders: self.folders.clone(),
+            active_folder: self.active_folder.clone(),
+            sounds: self.sounds.clone(),
+        };
+
+        if let Ok(json_str) = serde_json::to_string_pretty(&sounds_cfg) {
+            let _ = std::fs::write(dir.join("sounds.json"), json_str);
         }
     }
 
@@ -200,8 +243,8 @@ pub fn compute_duration_fast(path: &Path) -> Option<u64> {
     Some(time.seconds)
 }
 
-fn sys_config_path() -> PathBuf {
+fn config_dir() -> PathBuf {
     let mut path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()));
-    path.push(".config/nisound/config.json");
+    path.push(".config/nisound");
     path
 }
