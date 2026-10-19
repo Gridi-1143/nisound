@@ -672,7 +672,6 @@ impl SoundboardApp {
         });
 
         // ── RIGHT PANEL: Categories + Playback ──────────────────────────────
-        let btn_missing = self.color_from_key("Card Missing File", [100, 60, 60]);
         let btn_active = self.color_from_key("Button Active", [78, 86, 116]);
         let text = self.color_from_key("Text", [230, 230, 240]);
         egui::SidePanel::right("folders")
@@ -909,7 +908,7 @@ impl SoundboardApp {
                             ui.group(|ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    if ui.add_sized([22.0, 22.0], egui::Button::new("X").fill(btn_missing)).clicked() {
+                                    if ui.add_sized([22.0, 22.0], egui::Button::new("X").fill(btn_normal)).clicked() {
                                         to_stop = Some(*play_id);
                                     }
                                     
@@ -1627,6 +1626,8 @@ impl SoundboardApp {
         };
 
         let btn_normal = self.color_from_key("Button Normal", [48, 52, 70]);
+        let btn_active = self.color_from_key("Button Active", [78, 86, 116]);
+        let btn_missing = self.color_from_key("Card Missing File", [100, 60, 60]);
         let mut open = true;
 
         let sound_clone = self.state.sounds.get(&sound_id).cloned();
@@ -1666,9 +1667,9 @@ impl SoundboardApp {
 
                                     ui.strong("Status:");
                                     if sound.exists {
-                                        ui.colored_label(Color32::from_rgb(100, 200, 100), "✔ File found");
+                                        ui.colored_label(btn_active, "✔ File found");
                                     } else {
-                                        ui.colored_label(Color32::from_rgb(220, 80, 80), "✘ File missing");
+                                        ui.colored_label(btn_missing, "✘ File missing");
                                     }
                                     ui.end_row();
 
