@@ -20,10 +20,12 @@ pub struct AudioDevice {
     pub name: String,
     pub description: String,
     pub kind: DeviceKind,
+    #[allow(dead_code)]
     pub is_default: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum DeviceFilter {
     All,
     HardwareOnly,
@@ -32,6 +34,7 @@ pub enum DeviceFilter {
     MonitorsOnly,
 }
 
+#[allow(dead_code)]
 impl DeviceFilter {
     pub fn label(&self) -> &'static str {
         match self {

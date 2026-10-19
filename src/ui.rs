@@ -1,6 +1,6 @@
 use crate::audio::{AudioEngine, QueueItem};
 use crate::config::{hex_to_rgb, rgb_to_hex, AppState, Folder, SoundEntry};
-use crate::pulse_devices::{self, AudioDevice, DeviceFilter, DeviceKind};
+use crate::pulse_devices::{self, AudioDevice, DeviceKind};
 use egui::{epaint::Shadow, Color32, Context, Stroke, Ui, Visuals};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const SUPPORTED_EXTENSIONS: &[&str] = &[
-    "mp3", "wav", "ogg", "oga", "flac", "m4a", "m4b", "aac", "opus", "mp4", "webm", "mkv", "aiff", "aif"
+    "mp3", "wav", "ogg", "oga", "flac", "m4a", "m4b", "aac", "opus", "mp4", "webm", "mkv", "aiff", "aif",
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -30,6 +30,7 @@ struct ImportRequest {
     format_selection: BTreeMap<String, bool>,
 }
 
+#[allow(dead_code)]
 enum PendingAction {
     DeleteSound(Vec<Uuid>),
     DeleteFolder(Uuid),
@@ -62,8 +63,6 @@ pub struct SoundboardApp {
     sort_order: SortOrder,
     output_devices: Vec<AudioDevice>,
     input_devices: Vec<AudioDevice>,
-    output_filter: DeviceFilter,
-    mic_filter: DeviceFilter,
     mic_channel_exists: bool,
     mic_loopback_active: bool,
     pending_import: Option<ImportRequest>,
@@ -124,8 +123,6 @@ impl SoundboardApp {
             audio,
             output_devices,
             input_devices,
-            output_filter: DeviceFilter::All,
-            mic_filter: DeviceFilter::All,
             mic_channel_exists,
             mic_loopback_active,
             hotkey_rx: None,
@@ -259,6 +256,60 @@ impl SoundboardApp {
             }
         }
         self.state.save();
+    }
+
+    fn clear_missing_sounds_in_scope(&mut self, folder_id: Option<Uuid>) {
+        let missing_ids: Vec<Uuid> = match folder_id {
+            None => self
+                .state
+                .sounds
+                .iter()
+                .filter(|(_, s)| !s.exists)
+                .map(|(id, _)| *id)
+                .collect(),
+            Some(f_id) => {
+                if let Some(folder) = self.state.folders.iter().find(|f| f.id == f_id) {
+                    folder
+                        .sound_ids
+                        .iter()
+                        .filter_map(|id| self.state.sounds.get(id))
+                        .filter(|s| !s.exists)
+                        .map(|s| s.id)
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+
+        if !missing_ids.is_empty() {
+            for id in missing_ids {
+                self.state.sounds.remove(&id);
+                for f in &mut self.state.folders {
+                    f.sound_ids.retain(|s| s != &id);
+                }
+                self.selected_sounds.remove(&id);
+            }
+            self.state.save();
+        }
+    }
+
+    fn get_missing_sounds_count(&self, folder_id: Option<Uuid>) -> usize {
+        match folder_id {
+            None => self.state.sounds.values().filter(|s| !s.exists).count(),
+            Some(f_id) => {
+                if let Some(folder) = self.state.folders.iter().find(|f| f.id == f_id) {
+                    folder
+                        .sound_ids
+                        .iter()
+                        .filter_map(|id| self.state.sounds.get(id))
+                        .filter(|s| !s.exists)
+                        .count()
+                } else {
+                    0
+                }
+            }
+        }
     }
 
     fn get_effective_volume(&self, sound: &SoundEntry) -> (f32, f32) {
@@ -607,6 +658,8 @@ impl SoundboardApp {
 
                 let total_height = ui.available_height();
 
+                let mut action_clear_missing_folder: Option<Option<Uuid>> = None;
+
                 egui::ScrollArea::vertical()
                     .id_source("folders_scroll")
                     .max_height(total_height * 0.35)
@@ -617,6 +670,12 @@ impl SoundboardApp {
                             self.state.active_folder = None;
                         }
                         all_sounds_btn.context_menu(|ui| {
+                            let missing_cnt = self.get_missing_sounds_count(None);
+                            if ui.button(format!("Clear missing files ({})", missing_cnt)).clicked() {
+                                action_clear_missing_folder = Some(None);
+                                ui.close_menu();
+                            }
+                            ui.separator();
                             if ui.button("Clear all sounds").clicked() {
                                 self.show_clear_all_confirm = true;
                                 ui.close_menu();
@@ -627,22 +686,30 @@ impl SoundboardApp {
 
                         let mut target_folder_move = None;
 
-                        for folder in &self.state.folders {
-                            let is_selected = self.state.active_folder == Some(folder.id);
-                            let response = ui.selectable_label(is_selected, format!("📁 {}", folder.name));
+                        for idx in 0..self.state.folders.len() {
+                            let folder_id = self.state.folders[idx].id;
+                            let folder_name = self.state.folders[idx].name.clone();
+                            let is_selected = self.state.active_folder == Some(folder_id);
+                            let response = ui.selectable_label(is_selected, format!("📁 {}", folder_name));
 
                             if response.clicked() {
-                                self.state.active_folder = Some(folder.id);
+                                self.state.active_folder = Some(folder_id);
                             }
 
                             if response.hovered() && ctx.input(|i| i.pointer.any_released()) {
-                                target_folder_move = Some(folder.id);
+                                target_folder_move = Some(folder_id);
                             }
 
                             response.context_menu(|ui| {
+                                let missing_cnt = self.get_missing_sounds_count(Some(folder_id));
+                                if ui.button(format!("Clear missing files ({})", missing_cnt)).clicked() {
+                                    action_clear_missing_folder = Some(Some(folder_id));
+                                    ui.close_menu();
+                                }
+                                ui.separator();
                                 if ui.button("Delete folder").clicked() {
                                     self.confirm_action =
-                                        Some(PendingAction::DeleteFolder(folder.id));
+                                        Some(PendingAction::DeleteFolder(folder_id));
                                     ui.close_menu();
                                 }
                             });
@@ -677,6 +744,10 @@ impl SoundboardApp {
                             }
                         });
                     });
+
+                if let Some(target_scope) = action_clear_missing_folder {
+                    self.clear_missing_sounds_in_scope(target_scope);
+                }
 
                 ui.separator();
 
@@ -1042,6 +1113,16 @@ impl SoundboardApp {
                         std::cmp::Ordering::Equal
                     }
                 });
+
+                if ctx.input(|i| i.modifiers.command || i.modifiers.ctrl) {
+                    if ctx.input(|i| i.key_pressed(egui::Key::A)) {
+                        if ctx.input(|i| i.modifiers.shift) {
+                            self.selected_sounds.clear();
+                        } else {
+                            self.selected_sounds = sound_ids_to_render.iter().cloned().collect();
+                        }
+                    }
+                }
 
                 let cell_width = 310.0;
                 let available_width = ui.available_width().max(cell_width);
@@ -1804,6 +1885,94 @@ impl SoundboardApp {
             .unwrap_or(false)
     }
 
+    fn render_sound_context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        s: &mut SoundEntry,
+        mod_flag: &mut bool,
+    ) {
+        ui.label("Shortcut:");
+        if s.hotkey.is_some() {
+            if ui.button("Clear Shortcut").clicked() {
+                s.hotkey = None;
+                *mod_flag = true;
+                ui.close_menu();
+            }
+        } else {
+            ui.label("No shortcut assigned");
+        }
+        ui.separator();
+
+        if self.state.active_folder.is_some() {
+            if ui.button("Remove from folder").clicked() {
+                if self.selected_sounds.contains(&s.id) {
+                    self.action_remove_sounds_from_folder =
+                        self.selected_sounds.iter().cloned().collect();
+                } else {
+                    self.action_remove_sounds_from_folder = vec![s.id];
+                }
+                ui.close_menu();
+            }
+        }
+
+        if ui.button("Delete (from all sounds)").clicked() {
+            let ids = if self.selected_sounds.contains(&s.id) {
+                self.selected_sounds.iter().cloned().collect()
+            } else {
+                vec![s.id]
+            };
+            self.confirm_action = Some(PendingAction::DeleteSound(ids));
+            ui.close_menu();
+        }
+        ui.separator();
+
+        let mut cfg_changed = false;
+        cfg_changed |= ui.checkbox(&mut s.headphones_enabled, "Local Output").changed();
+        cfg_changed |= ui.checkbox(&mut s.mic_enabled, "Mic Output").changed();
+
+        if cfg_changed {
+            *mod_flag = true;
+            self.audio.update_live_channels(s.id, s.headphones_enabled, s.mic_enabled);
+        }
+        ui.separator();
+
+        let mut vol_changed = ui.checkbox(&mut s.use_global_volume, "Default volume").changed();
+
+        ui.add_enabled_ui(!s.use_global_volume, |ui| {
+            ui.label("Volume (Local sound):");
+            let hp_s = ui.add(egui::Slider::new(&mut s.volume_playback, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+            if hp_s.changed() { vol_changed = true; }
+            if hp_s.secondary_clicked() { s.volume_playback = 1.0; vol_changed = true; }
+            hp_s.on_hover_text("RMB to reset to 100%");
+
+            ui.label("Volume (Mic channel):");
+            let mic_s = ui.add(egui::Slider::new(&mut s.volume_out, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
+            if mic_s.changed() { vol_changed = true; }
+            if mic_s.secondary_clicked() { s.volume_out = 1.0; vol_changed = true; }
+            mic_s.on_hover_text("RMB to reset to 100%");
+        });
+
+        if vol_changed || cfg_changed {
+            *mod_flag = true;
+            let v_local = if s.use_global_volume { self.state.settings.global_volume_playback } else { s.volume_playback };
+            let v_mic = if s.use_global_volume { self.state.settings.global_volume_out } else { s.volume_out };
+            self.audio.update_live_volume(s.id, v_local, v_mic);
+        }
+        ui.separator();
+
+        if ui.button("Settings").clicked() {
+            self.active_sound_popup = Some(s.id);
+            self.active_sound_popup_tab = 0;
+            ui.close_menu();
+        }
+
+        if ui.button("Edit").clicked() {
+            self.active_sound_popup = Some(s.id);
+            self.active_sound_popup_tab = 1;
+            ui.close_menu();
+        }
+    }
+
     fn render_sound_widget(
         &mut self,
         ui: &mut Ui,
@@ -1817,11 +1986,16 @@ impl SoundboardApp {
 
             let card_bg = self.color_from_key("Card Background", [42, 42, 56]);
             let card_selected = self.color_from_key("Card Selected", [60, 80, 130]);
-            let card_missing = self.color_from_key("Card Missing File", [120, 45, 45]);
+            let card_missing = self.color_from_key("Card Missing File", [100, 60, 60]);
+            let card_missing_selected = self.color_from_key("Card Missing Selected", [140, 50, 70]);
             let btn_normal = self.color_from_key("Button Normal", [48, 52, 70]);
 
             let frame_color = if !sound.exists {
-                card_missing
+                if is_selected {
+                    card_missing_selected
+                } else {
+                    card_missing
+                }
             } else if is_selected {
                 card_selected
             } else {
@@ -2135,93 +2309,11 @@ impl SoundboardApp {
                             .inner;
 
                         let mut menu_modified = false;
-                        let menu_content = |ui: &mut egui::Ui, app: &mut Self, s: &mut SoundEntry, mod_flag: &mut bool| {
-                            ui.label("Shortcut:");
-                            if s.hotkey.is_some() {
-                                if ui.button("Clear Shortcut").clicked() {
-                                    s.hotkey = None;
-                                    *mod_flag = true;
-                                    ui.close_menu();
-                                }
-                            } else {
-                                ui.label("No shortcut assigned");
-                            }
-                            ui.separator();
 
-                            if app.state.active_folder.is_some() {
-                                if ui.button("Remove from folder").clicked() {
-                                    if app.selected_sounds.contains(&s.id) {
-                                        app.action_remove_sounds_from_folder =
-                                            app.selected_sounds.iter().cloned().collect();
-                                    } else {
-                                        app.action_remove_sounds_from_folder = vec![s.id];
-                                    }
-                                    ui.close_menu();
-                                }
-                            }
-
-                            if ui.button("Delete (from all sounds)").clicked() {
-                                let ids = if app.selected_sounds.contains(&s.id) {
-                                    app.selected_sounds.iter().cloned().collect()
-                                } else {
-                                    vec![s.id]
-                                };
-                                app.confirm_action = Some(PendingAction::DeleteSound(ids));
-                                ui.close_menu();
-                            }
-                            ui.separator();
-
-                            let mut cfg_changed = false;
-                            cfg_changed |= ui.checkbox(&mut s.headphones_enabled, "Local Output").changed();
-                            cfg_changed |= ui.checkbox(&mut s.mic_enabled, "Mic Output").changed();
-
-                            if cfg_changed {
-                                *mod_flag = true;
-                                app.audio.update_live_channels(s.id, s.headphones_enabled, s.mic_enabled);
-                            }
-                            ui.separator();
-
-                            let mut vol_changed = ui.checkbox(&mut s.use_global_volume, "Default volume").changed();
-                            
-                            ui.add_enabled_ui(!s.use_global_volume, |ui| {
-                                ui.label("Volume (Local sound):");
-                                let hp_s = ui.add(egui::Slider::new(&mut s.volume_playback, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-                                if hp_s.changed() { vol_changed = true; }
-                                if hp_s.secondary_clicked() { s.volume_playback = 1.0; vol_changed = true; }
-                                hp_s.on_hover_text("RMB to reset to 100%");
-
-                                ui.label("Volume (Mic channel):");
-                                let mic_s = ui.add(egui::Slider::new(&mut s.volume_out, 0.0..=2.0).custom_formatter(|v, _| format!("{:.0}%", v * 100.0)));
-                                if mic_s.changed() { vol_changed = true; }
-                                if mic_s.secondary_clicked() { s.volume_out = 1.0; vol_changed = true; }
-                                mic_s.on_hover_text("RMB to reset to 100%");
-                            });
-
-                            if vol_changed || cfg_changed {
-                                *mod_flag = true;
-                                let v_local = if s.use_global_volume { app.state.settings.global_volume_playback } else { s.volume_playback };
-                                let v_mic = if s.use_global_volume { app.state.settings.global_volume_out } else { s.volume_out };
-                                app.audio.update_live_volume(s.id, v_local, v_mic);
-                            }
-                            ui.separator();
-
-                            if ui.button("Settings").clicked() {
-                                app.active_sound_popup = Some(s.id);
-                                app.active_sound_popup_tab = 0;
-                                ui.close_menu();
-                            }
-
-                            if ui.button("Edit").clicked() {
-                                app.active_sound_popup = Some(s.id);
-                                app.active_sound_popup_tab = 1;
-                                ui.close_menu();
-                            }
-                        };
-
-                        bg_resp.context_menu(|ui| menu_content(ui, self, sound, &mut menu_modified));
-                        play_resp.context_menu(|ui| menu_content(ui, self, sound, &mut menu_modified));
-                        info_resp.context_menu(|ui| menu_content(ui, self, sound, &mut menu_modified));
-                        channels_resp.context_menu(|ui| menu_content(ui, self, sound, &mut menu_modified));
+                        bg_resp.context_menu(|ui| self.render_sound_context_menu(ui, sound, &mut menu_modified));
+                        play_resp.context_menu(|ui| self.render_sound_context_menu(ui, sound, &mut menu_modified));
+                        info_resp.context_menu(|ui| self.render_sound_context_menu(ui, sound, &mut menu_modified));
+                        channels_resp.context_menu(|ui| self.render_sound_context_menu(ui, sound, &mut menu_modified));
 
                         if menu_modified {
                             sound_changed = true;

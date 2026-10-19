@@ -20,59 +20,6 @@ fn main() -> eframe::Result<()> {
     let (tx, rx): (Sender<GlobalEvent>, Receiver<GlobalEvent>) = std::sync::mpsc::channel();
 
     let modifiers: Arc<Mutex<(bool, bool, bool)>> = Arc::new(Mutex::new((false, false, false)));
-    let modifiers_clone = modifiers.clone();
-
-    std::thread::spawn(move || {
-        if let Err(error) = rdev::listen(move |event| {
-            match event.event_type {
-                rdev::EventType::KeyPress(key) => {
-                    {
-                        let mut mods = modifiers_clone.lock().unwrap();
-                        match key {
-                            rdev::Key::ControlLeft | rdev::Key::ControlRight => mods.0 = true,
-                            rdev::Key::ShiftLeft   | rdev::Key::ShiftRight   => mods.1 = true,
-                            rdev::Key::Alt         | rdev::Key::AltGr        => mods.2 = true,
-                            _ => {}
-                        }
-                    }
-
-                    let is_modifier = matches!(
-                        key,
-                        rdev::Key::ControlLeft | rdev::Key::ControlRight
-                        | rdev::Key::ShiftLeft | rdev::Key::ShiftRight
-                        | rdev::Key::Alt | rdev::Key::AltGr
-                        | rdev::Key::MetaLeft | rdev::Key::MetaRight
-                    );
-
-                    if !is_modifier {
-                        let mods = modifiers_clone.lock().unwrap();
-                        let (ctrl, shift, alt) = *mods;
-
-                        let key_str = rdev_key_to_egui_name(&key);
-                        let mut combo = String::new();
-                        if ctrl  { combo.push_str("Ctrl+"); }
-                        if alt   { combo.push_str("Alt+"); }
-                        if shift { combo.push_str("Shift+"); }
-                        combo.push_str(&key_str);
-
-                        let _ = tx.send(GlobalEvent::HotkeyTriggered(combo));
-                    }
-                }
-                rdev::EventType::KeyRelease(key) => {
-                    let mut mods = modifiers_clone.lock().unwrap();
-                    match key {
-                        rdev::Key::ControlLeft | rdev::Key::ControlRight => mods.0 = false,
-                        rdev::Key::ShiftLeft   | rdev::Key::ShiftRight   => mods.1 = false,
-                        rdev::Key::Alt         | rdev::Key::AltGr        => mods.2 = false,
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-        }) {
-            eprintln!("Error starting rdev global listener: {:?}", error);
-        }
-    });
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -84,7 +31,64 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Nisound",
         options,
-        Box::new(|_cc| {
+        Box::new(move |cc| {
+            let ctx_clone = cc.egui_ctx.clone();
+            let modifiers_clone = modifiers.clone();
+
+            std::thread::spawn(move || {
+                if let Err(error) = rdev::listen(move |event| {
+                    match event.event_type {
+                        rdev::EventType::KeyPress(key) => {
+                            {
+                                let mut mods = modifiers_clone.lock().unwrap();
+                                match key {
+                                    rdev::Key::ControlLeft | rdev::Key::ControlRight => mods.0 = true,
+                                    rdev::Key::ShiftLeft   | rdev::Key::ShiftRight   => mods.1 = true,
+                                    rdev::Key::Alt         | rdev::Key::AltGr        => mods.2 = true,
+                                    _ => {}
+                                }
+                            }
+
+                            let is_modifier = matches!(
+                                key,
+                                rdev::Key::ControlLeft | rdev::Key::ControlRight
+                                | rdev::Key::ShiftLeft | rdev::Key::ShiftRight
+                                | rdev::Key::Alt | rdev::Key::AltGr
+                                | rdev::Key::MetaLeft | rdev::Key::MetaRight
+                            );
+
+                            if !is_modifier {
+                                let mods = modifiers_clone.lock().unwrap();
+                                let (ctrl, shift, alt) = *mods;
+
+                                let key_str = rdev_key_to_egui_name(&key);
+                                let mut combo = String::new();
+                                if ctrl  { combo.push_str("Ctrl+"); }
+                                if alt   { combo.push_str("Alt+"); }
+                                if shift { combo.push_str("Shift+"); }
+                                combo.push_str(&key_str);
+
+                                if tx.send(GlobalEvent::HotkeyTriggered(combo)).is_ok() {
+                                    ctx_clone.request_repaint();
+                                }
+                            }
+                        }
+                        rdev::EventType::KeyRelease(key) => {
+                            let mut mods = modifiers_clone.lock().unwrap();
+                            match key {
+                                rdev::Key::ControlLeft | rdev::Key::ControlRight => mods.0 = false,
+                                rdev::Key::ShiftLeft   | rdev::Key::ShiftRight   => mods.1 = false,
+                                rdev::Key::Alt         | rdev::Key::AltGr        => mods.2 = false,
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }) {
+                    eprintln!("Error starting rdev global listener: {:?}", error);
+                }
+            });
+
             let mut app = SoundboardApp::new(state);
             app.hotkey_rx = Some(rx);
             Box::new(app)

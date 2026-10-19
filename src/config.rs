@@ -90,6 +90,7 @@ impl AppState {
         colors.insert("Panels".to_string(), [30, 36, 48]);
         colors.insert("Card Background".to_string(), [25, 33, 45]);
         colors.insert("Card Missing File".to_string(), [100, 60, 60]);
+        colors.insert("Card Missing Selected".to_string(), [159, 81, 95]);
         colors.insert("Card Selected".to_string(), [57, 80, 109]);
         colors.insert("Button Normal".to_string(), [33, 45, 63]);
         colors.insert("Button Hovered".to_string(), [33, 45, 63]);
@@ -173,7 +174,7 @@ pub fn hex_to_rgb(hex: &str) -> Option<[u8; 3]> {
     }
     let r = u8::from_str_radix(&clean[0..2], 16).ok()?;
     let g = u8::from_str_radix(&clean[2..4], 16).ok()?;
-    let b = u8::from_str_radix(&clean[4..6], 16).ok()?;
+    let b = u8::from_str_radix(&clean[3..6], 16).ok()?;
     Some([r, g, b])
 }
 

@@ -6,7 +6,6 @@ use pulse::sample::{Format, Spec};
 use pulse::stream::Direction;
 use libpulse_simple_binding::Simple;
 use crate::sym_decoder::SymDecoder;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
