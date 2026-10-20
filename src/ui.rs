@@ -1678,7 +1678,7 @@ impl SoundboardApp {
                 .open(&mut open)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut self.active_settings_tab, 0, "Tracks");
+                        ui.selectable_value(&mut self.active_settings_tab, 0, "Audio");
                         ui.selectable_value(&mut self.active_settings_tab, 1, "Interface");
                         ui.selectable_value(&mut self.active_settings_tab, 2, "Downloads");
                     });
