@@ -4,9 +4,12 @@ use crate::pulse_devices::{self, AudioDevice, DeviceKind};
 use egui::{epaint::Shadow, Color32, Context, Stroke, Ui, Visuals};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -20,6 +23,14 @@ enum SortOrder {
     TimeDesc,
     AlphaAsc,
     AlphaDesc,
+}
+
+struct CardColors {
+    bg: Color32,
+    selected: Color32,
+    missing: Color32,
+    missing_selected: Color32,
+    btn_normal: Color32,
 }
 
 #[derive(Clone)]
@@ -51,6 +62,31 @@ struct KeybindCapture {
     alt: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum DownloadStatus {
+    Queued,
+    Downloading,
+    Finished,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub struct DownloadTask {
+    pub id: Uuid,
+    pub url: String,
+    pub command: String,
+    pub status: DownloadStatus,
+    pub log_output: String,
+    pub auto_import: bool,
+    pub target_folder: Option<Uuid>,
+    pub download_dir: Option<PathBuf>,
+}
+
+pub enum DownloadMsg {
+    LogLine(Uuid, String),
+    Finished(Uuid, bool),
+}
+
 pub struct SoundboardApp {
     pub state: AppState,
     pub audio: AudioEngine,
@@ -60,6 +96,26 @@ pub struct SoundboardApp {
     pub active_settings_tab: usize,
     pub hotkey_rx: Option<std::sync::mpsc::Receiver<crate::GlobalEvent>>,
     pub search_query: String,
+    
+    pub show_download_window: bool,
+    pub download_url: String,
+    pub download_audio_only: bool,
+    pub download_embed_thumb: bool,
+    pub download_is_playlist: bool,
+    pub download_custom_length: bool,
+    pub download_time_from: String,
+    pub download_time_to: String,
+    pub download_use_default_path: bool,
+    pub download_custom_path: Option<PathBuf>,
+    pub download_custom_cmd: String,
+    pub download_auto_import: bool,
+    pub download_tasks: Vec<DownloadTask>,
+    pub active_download_id: Option<Uuid>,
+    pub selected_task_id: Option<Uuid>,
+    active_pid: Arc<Mutex<Option<u32>>>,
+    download_tx: Sender<DownloadMsg>,
+    download_rx: Receiver<DownloadMsg>,
+
     sort_order: SortOrder,
     output_devices: Vec<AudioDevice>,
     input_devices: Vec<AudioDevice>,
@@ -118,7 +174,11 @@ impl SoundboardApp {
             }
         }
 
-        Self {
+        let (dl_tx, dl_rx) = channel::<DownloadMsg>();
+        let default_audio = state.settings.download.audio_only;
+        let default_thumb = state.settings.download.embed_thumbnail;
+
+        let mut app = Self {
             state,
             audio,
             output_devices,
@@ -127,6 +187,26 @@ impl SoundboardApp {
             mic_loopback_active,
             hotkey_rx: None,
             search_query: String::new(),
+            
+            show_download_window: false,
+            download_url: String::new(),
+            download_audio_only: default_audio,
+            download_embed_thumb: default_thumb,
+            download_is_playlist: false,
+            download_custom_length: false,
+            download_time_from: String::new(),
+            download_time_to: String::new(),
+            download_use_default_path: true,
+            download_custom_path: None,
+            download_custom_cmd: String::new(),
+            download_auto_import: true,
+            download_tasks: Vec::new(),
+            active_download_id: None,
+            selected_task_id: None,
+            active_pid: Arc::new(Mutex::new(None)),
+            download_tx: dl_tx,
+            download_rx: dl_rx,
+
             sort_order: SortOrder::TimeDesc,
             selected_sounds: HashSet::new(),
             selected_queue_id: None,
@@ -149,11 +229,206 @@ impl SoundboardApp {
             metadata_tx: task_tx,
             metadata_rx: res_rx,
             hex_inputs: BTreeMap::new(),
-        }
+        };
+
+        app.rebuild_download_cmd();
+        app
     }
 
     pub fn shutdown(&self) {
+        self.kill_active_download();
         pulse_devices::remove_mic_channel();
+    }
+
+    fn kill_active_download(&self) {
+        if let Ok(mut lock) = self.active_pid.lock() {
+            if let Some(pid) = lock.take() {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+            }
+        }
+    }
+
+    fn rebuild_download_cmd(&mut self) {
+        let folder = if self.download_use_default_path {
+            self.state
+                .settings
+                .download
+                .folder
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "FOLDER_NOT_SET".to_string())
+        } else {
+            self.download_custom_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "FOLDER_NOT_SET".to_string())
+        };
+
+        let url = if self.download_url.trim().is_empty() {
+            "{url}"
+        } else {
+            self.download_url.trim()
+        };
+
+        let mut cmd = format!("yt-dlp \"{}\"", url);
+        if self.download_audio_only {
+            cmd.push_str(" -x");
+        }
+        if self.download_embed_thumb {
+            cmd.push_str(" --embed-thumbnail");
+        }
+        if self.download_is_playlist {
+            cmd.push_str(" --yes-playlist");
+        } else {
+            cmd.push_str(" --no-playlist");
+        }
+        if self.download_custom_length {
+            let from = if self.download_time_from.trim().is_empty() {
+                "0"
+            } else {
+                self.download_time_from.trim()
+            };
+            let to = if self.download_time_to.trim().is_empty() {
+                "inf"
+            } else {
+                self.download_time_to.trim()
+            };
+            cmd.push_str(&format!(" --download-sections \"*{}-{}\"", from, to));
+        }
+        cmd.push_str(&format!(" -o \"{}/%(title)s.%(ext)s\"", folder));
+
+        self.download_custom_cmd = cmd;
+    }
+
+    fn process_download_messages(&mut self) {
+        while let Ok(msg) = self.download_rx.try_recv() {
+            match msg {
+                DownloadMsg::LogLine(id, line) => {
+                    if let Some(task) = self.download_tasks.iter_mut().find(|t| t.id == id) {
+                        task.log_output.push_str(&line);
+                        task.log_output.push('\n');
+                    }
+                }
+                DownloadMsg::Finished(id, success) => {
+                    let mut auto_import_info = None;
+
+                    if let Some(task) = self.download_tasks.iter_mut().find(|t| t.id == id) {
+                        task.status = if success {
+                            DownloadStatus::Finished
+                        } else {
+                            DownloadStatus::Failed
+                        };
+                        if success && task.auto_import {
+                            auto_import_info = Some((task.target_folder, task.download_dir.clone()));
+                        }
+                    }
+
+                    if let Some((target_folder, dl_dir_opt)) = auto_import_info {
+                        if let Some(dl_dir) = dl_dir_opt {
+                            let mut found_paths = Vec::new();
+                            Self::collect_audio_files(&dl_dir, &mut found_paths);
+                            let existing_paths: HashSet<_> = self.state.sounds.values().map(|s| s.path.clone()).collect();
+                            let new_files: Vec<_> = found_paths.into_iter().filter(|p| !existing_paths.contains(p)).collect();
+                            if !new_files.is_empty() {
+                                self.import_sound_paths(new_files, target_folder);
+                            }
+                        }
+                    }
+
+                    if self.active_download_id == Some(id) {
+                        self.active_download_id = None;
+                    }
+                    self.trigger_next_download();
+                }
+            }
+        }
+    }
+
+    fn trigger_next_download(&mut self) {
+        if self.active_download_id.is_some() {
+            return;
+        }
+
+        let next_task = self
+            .download_tasks
+            .iter_mut()
+            .find(|t| t.status == DownloadStatus::Queued);
+
+        if let Some(task) = next_task {
+            task.status = DownloadStatus::Downloading;
+            let task_id = task.id;
+            let cmd_str = task.command.clone();
+            self.active_download_id = Some(task_id);
+
+            let tx = self.download_tx.clone();
+            let active_pid = self.active_pid.clone();
+
+            std::thread::spawn(move || {
+                let args = parse_cmd_string(&cmd_str);
+                if args.is_empty() {
+                    let _ = tx.send(DownloadMsg::LogLine(task_id, "Error: empty command".into()));
+                    let _ = tx.send(DownloadMsg::Finished(task_id, false));
+                    return;
+                }
+
+                let mut child = match Command::new(&args[0])
+                    .args(&args[1..])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(DownloadMsg::LogLine(
+                            task_id,
+                            format!("Failed to execute command: {}", e),
+                        ));
+                        let _ = tx.send(DownloadMsg::Finished(task_id, false));
+                        return;
+                    }
+                };
+
+                let pid = child.id();
+                if let Ok(mut lock) = active_pid.lock() {
+                    *lock = Some(pid);
+                }
+
+                let stdout = child.stdout.take();
+                let stderr = child.stderr.take();
+
+                let tx_out = tx.clone();
+                let handle_out = std::thread::spawn(move || {
+                    if let Some(out) = stdout {
+                        let reader = BufReader::new(out);
+                        for line in reader.lines().flatten() {
+                            let _ = tx_out.send(DownloadMsg::LogLine(task_id, line));
+                        }
+                    }
+                });
+
+                let tx_err = tx.clone();
+                let handle_err = std::thread::spawn(move || {
+                    if let Some(err) = stderr {
+                        let reader = BufReader::new(err);
+                        for line in reader.lines().flatten() {
+                            let _ = tx_err.send(DownloadMsg::LogLine(task_id, line));
+                        }
+                    }
+                });
+
+                let _ = handle_out.join();
+                let _ = handle_err.join();
+
+                let status = child.wait();
+
+                if let Ok(mut lock) = active_pid.lock() {
+                    *lock = None;
+                }
+
+                let success = status.map(|s| s.success()).unwrap_or(false);
+                let _ = tx.send(DownloadMsg::Finished(task_id, success));
+            });
+        }
     }
 
     fn refresh_devices(&mut self) {
@@ -322,6 +597,7 @@ impl SoundboardApp {
 
     pub fn render_ui(&mut self, ctx: &Context) {
         self.apply_custom_theme(ctx);
+        self.process_download_messages();
 
         let mut save_needed = false;
         while let Ok((id, dur)) = self.metadata_rx.try_recv() {
@@ -335,73 +611,6 @@ impl SoundboardApp {
         }
 
         self.audio.clean_dead_sinks(&self.state);
-
-        if ctx.memory(|m| m.focused().is_none()) && ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
-            let ctrl = ctx.input(|i| i.modifiers.command || i.modifiers.ctrl);
-
-            if ctrl {
-                let mut selected_vec: Vec<Uuid> = if !self.selected_sounds.is_empty() {
-                    self.selected_sounds.iter().cloned().collect()
-                } else if let Some(id) = self.last_selected_sound {
-                    vec![id]
-                } else {
-                    Vec::new()
-                };
-
-                selected_vec.sort_by(|a, b| {
-                    let s_a = self.state.sounds.get(a);
-                    let s_b = self.state.sounds.get(b);
-                    if let (Some(sa), Some(sb)) = (s_a, s_b) {
-                        match self.sort_order {
-                            SortOrder::TimeAsc => sa.time_added.cmp(&sb.time_added),
-                            SortOrder::TimeDesc => sb.time_added.cmp(&sa.time_added),
-                            SortOrder::AlphaAsc => sa.name.to_lowercase().cmp(&sb.name.to_lowercase()),
-                            SortOrder::AlphaDesc => sb.name.to_lowercase().cmp(&sa.name.to_lowercase()),
-                        }
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
-                });
-
-                for sound_id in selected_vec {
-                    if let Some(sound) = self.state.sounds.get(&sound_id) {
-                        let (v_local, v_mic) = self.get_effective_volume(sound);
-                        self.audio.play_sound(
-                            sound.id,
-                            &sound.name,
-                            &sound.path,
-                            v_local,
-                            v_mic,
-                            sound.headphones_enabled,
-                            sound.mic_enabled,
-                            &self.state.settings.default_output,
-                            &self.state.settings.mic_sink,
-                            sound.duration_secs,
-                            false,
-                            true,
-                        );
-                    }
-                }
-            } else if let Some(sound_id) = self.last_selected_sound {
-                if let Some(sound) = self.state.sounds.get(&sound_id) {
-                    let (v_local, v_mic) = self.get_effective_volume(sound);
-                    self.audio.play_sound(
-                        sound.id,
-                        &sound.name,
-                        &sound.path,
-                        v_local,
-                        v_mic,
-                        sound.headphones_enabled,
-                        sound.mic_enabled,
-                        &self.state.settings.default_output,
-                        &self.state.settings.mic_sink,
-                        sound.duration_secs,
-                        self.state.settings.allow_overlap,
-                        self.state.settings.queue_sounds,
-                    );
-                }
-            }
-        }
 
         let btn_normal = self.color_from_key("Button Normal", [48, 52, 70]);
 
@@ -672,12 +881,10 @@ impl SoundboardApp {
         });
 
         // ── RIGHT PANEL: Categories + Playback ──────────────────────────────
-        let btn_active = self.color_from_key("Button Active", [78, 86, 116]);
-        let text = self.color_from_key("Text", [230, 230, 240]);
         egui::SidePanel::right("folders")
             .resizable(true)
-            .default_width(560.0)
-            .width_range(440.0..=740.0)
+            .default_width(530.0)
+            .width_range(100.0..=870.0)
             .show(ctx, |ui| {
                 let active_snapshot: Vec<(Uuid, String, bool, bool, f32, Option<u64>)> = {
                     if let Ok(active) = self.audio.active_sounds.lock() {
@@ -704,7 +911,6 @@ impl SoundboardApp {
                 };
 
                 let total_height = ui.available_height();
-
                 let mut action_clear_missing_folder: Option<Option<Uuid>> = None;
 
                 egui::ScrollArea::vertical()
@@ -830,7 +1036,7 @@ impl SoundboardApp {
                     ui.horizontal(|ui| {
                         ui.heading("Playback");
                         
-                        if ui.add(egui::Button::new("⏹ Stop All").fill(btn_normal)).clicked() {
+                        if ui.add(egui::Button::new("⏹ Stop").fill(btn_normal)).clicked() {
                             self.audio.stop_all();
                         }
 
@@ -876,7 +1082,7 @@ impl SoundboardApp {
                         } else {
                             let btn_text = match &self.state.settings.stop_all_hotkey {
                                 Some(hk) => format!("⌨ {}", hk),
-                                None => "➕ Hotkey".to_string(),
+                                None => "➕ Key".to_string(),
                             };
                             let btn_resp = ui.add(egui::Button::new(&btn_text).fill(btn_normal));
                             if btn_resp.clicked() {
@@ -917,7 +1123,9 @@ impl SoundboardApp {
                                         to_pause = Some(*play_id);
                                     }
                                     
-                                    let loop_color = if *is_looping { btn_active } else { text };
+                                    let btn_act = self.color_from_key("Button Active", [78, 86, 116]);
+                                    let text_col = self.color_from_key("Text", [230, 230, 240]);
+                                    let loop_color = if *is_looping { btn_act } else { text_col };
                                     if ui.add_sized([22.0, 22.0], egui::Button::new(egui::RichText::new("🔁").color(loop_color)).fill(btn_normal)).on_hover_text("Loop sound").clicked() {
                                         to_loop = Some(*play_id);
                                     }
@@ -1090,7 +1298,21 @@ impl SoundboardApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("🔍");
-                ui.text_edit_singleline(&mut self.search_query);
+                ui.add(egui::TextEdit::singleline(&mut self.search_query).desired_width(100.0));
+
+                ui.separator();
+                
+                let dl_btn_text = if self.active_download_id.is_some() {
+                    "⬇ Downloads (⏳ In Progress)"
+                } else if !self.download_tasks.is_empty() {
+                    "⬇ Downloads (Queue)"
+                } else {
+                    "⬇ Downloads"
+                };
+
+                if ui.add(egui::Button::new(dl_btn_text).fill(btn_normal)).clicked() {
+                    self.show_download_window = !self.show_download_window;
+                }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     egui::ComboBox::from_id_source("sort_order")
@@ -1106,121 +1328,359 @@ impl SoundboardApp {
                             ui.selectable_value(&mut self.sort_order, SortOrder::AlphaAsc, "A-Z");
                             ui.selectable_value(&mut self.sort_order, SortOrder::AlphaDesc, "Z-A");
                         });
-                    ui.label("Sort:");
                 });
             });
             ui.separator();
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let mut sound_ids_to_render: Vec<Uuid> = {
-                    let mut seen = std::collections::HashSet::new();
+            let mut sound_ids_to_render: Vec<Uuid> = {
+                let mut seen = std::collections::HashSet::new();
 
-                    match self.state.active_folder {
-                        None => self
-                            .state
-                            .sounds
-                            .keys()
-                            .cloned()
-                            .filter(|id| seen.insert(*id))
-                            .collect(),
-                        Some(f_id) => self
-                            .state
-                            .folders
-                            .iter()
-                            .find(|f| f.id == f_id)
-                            .map(|f| {
-                                f.sound_ids
-                                    .iter()
-                                    .cloned()
-                                    .filter(|id| seen.insert(*id))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    }
-                };
-
-                if !self.search_query.is_empty() {
-                    let q = self.search_query.to_lowercase();
-                    sound_ids_to_render.retain(|id| {
-                        self.state.sounds.get(id).map_or(false, |s| s.name.to_lowercase().contains(&q))
-                    });
+                match self.state.active_folder {
+                    None => self
+                        .state
+                        .sounds
+                        .keys()
+                        .cloned()
+                        .filter(|id| seen.insert(*id))
+                        .collect(),
+                    Some(f_id) => self
+                        .state
+                        .folders
+                        .iter()
+                        .find(|f| f.id == f_id)
+                        .map(|f| {
+                            f.sound_ids
+                                .iter()
+                                .cloned()
+                                .filter(|id| seen.insert(*id))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 }
+            };
 
-                sound_ids_to_render.sort_by(|a, b| {
-                    let s_a = self.state.sounds.get(a);
-                    let s_b = self.state.sounds.get(b);
-                    if let (Some(sa), Some(sb)) = (s_a, s_b) {
-                        match self.sort_order {
-                            SortOrder::TimeAsc => sa.time_added.cmp(&sb.time_added),
-                            SortOrder::TimeDesc => sb.time_added.cmp(&sa.time_added),
-                            SortOrder::AlphaAsc => sa.name.to_lowercase().cmp(&sb.name.to_lowercase()),
-                            SortOrder::AlphaDesc => sb.name.to_lowercase().cmp(&sa.name.to_lowercase()),
-                        }
-                    } else {
-                        std::cmp::Ordering::Equal
-                    }
+            if !self.search_query.is_empty() {
+                let q = self.search_query.to_lowercase();
+                sound_ids_to_render.retain(|id| {
+                    self.state.sounds.get(id).map_or(false, |s| s.name.to_lowercase().contains(&q))
                 });
+            }
 
-                if ctx.input(|i| i.modifiers.command || i.modifiers.ctrl) {
-                    if ctx.input(|i| i.key_pressed(egui::Key::A)) {
-                        if ctx.input(|i| i.modifiers.shift) {
-                            self.selected_sounds.clear();
-                        } else {
-                            self.selected_sounds = sound_ids_to_render.iter().cloned().collect();
-                        }
+            sound_ids_to_render.sort_by(|a, b| {
+                let s_a = self.state.sounds.get(a);
+                let s_b = self.state.sounds.get(b);
+                if let (Some(sa), Some(sb)) = (s_a, s_b) {
+                    match self.sort_order {
+                        SortOrder::TimeAsc => sa.time_added.cmp(&sb.time_added),
+                        SortOrder::TimeDesc => sb.time_added.cmp(&sa.time_added),
+                        SortOrder::AlphaAsc => sa.name.chars().flat_map(|c| c.to_lowercase()).cmp(sb.name.chars().flat_map(|c| c.to_lowercase())),
+                        SortOrder::AlphaDesc => sb.name.chars().flat_map(|c| c.to_lowercase()).cmp(sa.name.chars().flat_map(|c| c.to_lowercase())),
                     }
-                }
-
-                let cell_width = 310.0;
-                let available_width = ui.available_width().max(cell_width);
-                let columns = ((available_width / cell_width).floor() as usize).max(1);
-
-                let mut sounds_to_update: Vec<SoundEntry> = Vec::new();
-
-                egui::Grid::new(("sounds_grid", self.state.active_folder))
-                    .num_columns(columns)
-                    .spacing([10.0, 10.0])
-                    .min_col_width(cell_width)
-                    .max_col_width(cell_width)
-                    .show(ui, |ui| {
-                        let mut col_count = 0;
-                        for id in &sound_ids_to_render {
-                            if let Some(sound) = self.state.sounds.get(id) {
-                                let mut sound_copy = sound.clone();
-                                let modified = self.render_sound_widget(ui, &mut sound_copy, ctx, &sound_ids_to_render);
-                                if modified {
-                                    sounds_to_update.push(sound_copy);
-                                }
-
-                                col_count += 1;
-                                if col_count == columns {
-                                    col_count = 0;
-                                    ui.end_row();
-                                }
-                            }
-                        }
-                    });
-
-                if !sounds_to_update.is_empty() {
-                    for sound in sounds_to_update {
-                        self.state.sounds.insert(sound.id, sound);
-                    }
-                    self.state.save();
+                } else {
+                    std::cmp::Ordering::Equal
                 }
             });
+
+            if ctx.input(|i| i.modifiers.command || i.modifiers.ctrl) {
+                if ctx.input(|i| i.key_pressed(egui::Key::A)) {
+                    if ctx.input(|i| i.modifiers.shift) {
+                        self.selected_sounds.clear();
+                    } else {
+                        self.selected_sounds = sound_ids_to_render.iter().cloned().collect();
+                    }
+                }
+            }
+
+            let card_colors = CardColors {
+                bg: self.color_from_key("Card Background", [42, 42, 56]),
+                selected: self.color_from_key("Card Selected", [60, 80, 130]),
+                missing: self.color_from_key("Card Missing File", [100, 60, 60]),
+                missing_selected: self.color_from_key("Card Missing Selected", [140, 50, 70]),
+                btn_normal: self.color_from_key("Button Normal", [48, 52, 70]),
+            };
+
+            let inner_card_width = 320.0;
+            let frame_margin = 8.0;
+            let outer_card_width = inner_card_width + frame_margin;
+            let horizontal_spacing = 10.0;
+            let scrollbar_margin = 20.0;
+
+            let available_width = (ui.available_width() - scrollbar_margin).max(1.0);
+
+            let columns = (((available_width + horizontal_spacing) / (outer_card_width + horizontal_spacing)).floor() as usize).max(1);
+            let total_rows = (sound_ids_to_render.len() + columns - 1) / columns;
+
+            let effective_card_width = if columns == 1 {
+                (available_width - frame_margin).clamp(150.0, inner_card_width)
+            } else {
+                inner_card_width
+            };
+
+            let mut sounds_to_update: Vec<SoundEntry> = Vec::new();
+
+            ui.spacing_mut().item_spacing.y = 8.0;
+            let row_height = 62.0;
+
+            egui::ScrollArea::vertical().show_rows(
+                ui,
+                row_height,
+                total_rows,
+                |ui, row_range| {
+                    for row_idx in row_range {
+                        let start_idx = row_idx * columns;
+                        let end_idx = (start_idx + columns).min(sound_ids_to_render.len());
+                        let chunk = &sound_ids_to_render[start_idx..end_idx];
+
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = horizontal_spacing;
+                            for id in chunk {
+                                if let Some(mut sound) = self.state.sounds.remove(id) {
+                                    let modified = self.render_sound_widget(
+                                        ui,
+                                        &mut sound,
+                                        ctx,
+                                        &sound_ids_to_render,
+                                        &card_colors,
+                                        effective_card_width,
+                                    );
+                                    if modified {
+                                        sounds_to_update.push(sound);
+                                    } else {
+                                        self.state.sounds.insert(*id, sound);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                },
+            );
+
+            if !sounds_to_update.is_empty() {
+                for sound in sounds_to_update {
+                    self.state.sounds.insert(sound.id, sound);
+                }
+                self.state.save();
+            }
         });
+
+        // ── DOWNLOAD MANAGER WINDOW ─────────────────────────────────────────
+        if self.show_download_window {
+            let mut open = self.show_download_window;
+
+            egui::Window::new("⬇ Download Manager (yt-dlp)")
+                .default_width(580.0)
+                .min_width(450.0)
+                .resizable(true)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(egui::RichText::new("Download Options").strong());
+
+                    let mut flags_changed = false;
+
+                    ui.horizontal(|ui| {
+                        ui.label("URL:");
+                        let url_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.download_url)
+                                .desired_width(ui.available_width())
+                                .hint_text("https://www.youtube.com/watch?..."),
+                        );
+                        if url_resp.changed() {
+                            flags_changed = true;
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut self.download_audio_only, "Audio only (-x)").changed() {
+                            flags_changed = true;
+                        }
+                        if ui.checkbox(&mut self.download_embed_thumb, "Embed thumbnail").changed() {
+                            flags_changed = true;
+                        }
+                        if ui.checkbox(&mut self.download_is_playlist, "Playlist").changed() {
+                            flags_changed = true;
+                        }
+                        if ui.checkbox(&mut self.download_custom_length, "Custom duration").changed() {
+                            flags_changed = true;
+                        }
+                    });
+
+                    if self.download_custom_length {
+                        ui.horizontal(|ui| {
+                            ui.label("From (sec/HH:MM:SS):");
+                            if ui.add(egui::TextEdit::singleline(&mut self.download_time_from).desired_width(60.0)).changed() {
+                                flags_changed = true;
+                            }
+                            ui.label("To:");
+                            if ui.add(egui::TextEdit::singleline(&mut self.download_time_to).desired_width(60.0)).changed() {
+                                flags_changed = true;
+                            }
+                        });
+                    }
+
+                    if ui.checkbox(&mut self.download_use_default_path, "Default download path").changed() {
+                        flags_changed = true;
+                    }
+
+                    if !self.download_use_default_path {
+                        ui.horizontal(|ui| {
+                            ui.label("Custom path:");
+                            let path_str = self
+                                .download_custom_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "Not chosen".to_string());
+                            ui.label(path_str);
+                            if ui.button("Choose folder").clicked() {
+                                if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                    self.download_custom_path = Some(path);
+                                    flags_changed = true;
+                                }
+                            }
+                        });
+                    }
+
+                    ui.checkbox(
+                        &mut self.download_auto_import,
+                        "📥 Auto-import to current folder after download",
+                    );
+
+                    if flags_changed {
+                        self.rebuild_download_cmd();
+                    }
+
+                    ui.add_space(4.0);
+                    ui.label("Command (editable before adding):");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.download_custom_cmd)
+                            .desired_width(ui.available_width())
+                            .desired_rows(2),
+                    );
+
+                    ui.horizontal(|ui| {
+                        if ui.add(egui::Button::new("➕ Add to Queue").fill(btn_normal)).clicked() {
+                            let effective_folder = if self.download_use_default_path {
+                                self.state.settings.download.folder.clone()
+                            } else {
+                                self.download_custom_path.clone()
+                            };
+
+                            if effective_folder.is_none() {
+                                self.error_message = Some("Please select a download folder first!".to_string());
+                            } else if !self.download_url.trim().is_empty() {
+                                let task = DownloadTask {
+                                    id: Uuid::new_v4(),
+                                    url: self.download_url.trim().to_string(),
+                                    command: self.download_custom_cmd.clone(),
+                                    status: DownloadStatus::Queued,
+                                    log_output: String::new(),
+                                    auto_import: self.download_auto_import,
+                                    target_folder: self.state.active_folder,
+                                    download_dir: effective_folder,
+                                };
+                                self.download_tasks.push(task);
+                                self.download_url.clear();
+                                self.rebuild_download_cmd();
+                                self.trigger_next_download();
+                            }
+                        }
+
+                        if ui.button("🔄 Refresh Command").clicked() {
+                            self.rebuild_download_cmd();
+                        }
+                    });
+
+                    ui.separator();
+                    ui.label(egui::RichText::new("Queue & Output Logs").strong());
+
+                    let mut task_to_delete = None;
+                    let selected_id = self.selected_task_id;
+
+                    egui::ScrollArea::vertical()
+                        .max_height(140.0)
+                        .id_source("download_queue_scroll")
+                        .show(ui, |ui| {
+                            if self.download_tasks.is_empty() {
+                                ui.label("Download queue is empty");
+                            } else {
+                                for task in &self.download_tasks {
+                                    let is_selected = selected_id == Some(task.id);
+                                    let status_str = match task.status {
+                                        DownloadStatus::Queued => "⏳ Queued",
+                                        DownloadStatus::Downloading => "🔄 Downloading...",
+                                        DownloadStatus::Finished => "✅ Finished",
+                                        DownloadStatus::Failed => "❌ Failed",
+                                    };
+
+                                    ui.horizontal(|ui| {
+                                        if ui.small_button("❌").clicked() {
+                                            task_to_delete = Some(task.id);
+                                        }
+
+                                        let label_text = format!("{} | {}", status_str, task.url);
+                                        if ui.selectable_label(is_selected, label_text).clicked() {
+                                            self.selected_task_id = Some(task.id);
+                                        }
+                                    });
+                                }
+                            }
+                        });
+
+                    if let Some(del_id) = task_to_delete {
+                        if Some(del_id) == self.active_download_id {
+                            self.kill_active_download();
+                        }
+                        self.download_tasks.retain(|t| t.id != del_id);
+                        if self.selected_task_id == Some(del_id) {
+                            self.selected_task_id = None;
+                        }
+                    }
+
+                    ui.separator();
+                    ui.label("Logs for active / selected task:");
+
+                    let display_task = if let Some(sel_id) = self.selected_task_id {
+                        self.download_tasks.iter().find(|t| t.id == sel_id)
+                    } else if let Some(act_id) = self.active_download_id {
+                        self.download_tasks.iter().find(|t| t.id == act_id)
+                    } else {
+                        self.download_tasks.last()
+                    };
+
+                    let log_text = display_task.map(|t| t.log_output.as_str()).unwrap_or("No active logs");
+
+                    egui::ScrollArea::vertical()
+                        .max_height(180.0)
+                        .id_source("download_logs_scroll")
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut log_text.to_string())
+                                    .font(egui::TextStyle::Monospace)
+                                    .desired_width(ui.available_width())
+                                    .interactive(false),
+                            );
+                        });
+                });
+
+            self.show_download_window = open;
+        }
 
         // ── GENERAL SETTINGS WINDOW ──────────────────────────────────────────
         if self.show_settings {
             let mut want_refresh_devices = false;
             let mut want_refresh_mic_status = false;
+            let mut open = self.show_settings;
 
             egui::Window::new("General Settings")
-                .open(&mut self.show_settings)
+                .default_width(500.0)
+                .min_width(350.0)
+                .resizable(true)
+                .open(&mut open)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.selectable_value(&mut self.active_settings_tab, 0, "Tracks");
                         ui.selectable_value(&mut self.active_settings_tab, 1, "Interface");
+                        ui.selectable_value(&mut self.active_settings_tab, 2, "Downloads");
                     });
                     ui.separator();
 
@@ -1326,9 +1786,41 @@ impl SoundboardApp {
                                 self.state.save();
                             }
                         }
+                        2 => {
+                            ui.heading("Download Settings (Defaults)");
+
+                            ui.horizontal(|ui| {
+                                ui.label("Folder:");
+                                let path_str = self.state.settings.download.folder.as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "Not chosen".to_string());
+                                ui.label(path_str);
+                                if ui.button("Choose a folder").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                        self.state.settings.download.folder = Some(path);
+                                        self.state.save();
+                                        self.rebuild_download_cmd();
+                                    }
+                                }
+                            });
+                            ui.separator();
+
+                            let mut flags_changed = false;
+                            flags_changed |= ui.checkbox(&mut self.state.settings.download.audio_only, "Default Audio only (-x)").changed();
+                            flags_changed |= ui.checkbox(&mut self.state.settings.download.embed_thumbnail, "Default Embed thumbnail").changed();
+
+                            if flags_changed {
+                                self.download_audio_only = self.state.settings.download.audio_only;
+                                self.download_embed_thumb = self.state.settings.download.embed_thumbnail;
+                                self.state.save();
+                                self.rebuild_download_cmd();
+                            }
+                        }
                         _ => {}
                     }
                 });
+
+            self.show_settings = open;
 
             if want_refresh_devices {
                 self.refresh_devices();
@@ -2028,16 +2520,18 @@ impl SoundboardApp {
         sound: &mut SoundEntry,
         ctx: &Context,
         all_ids: &[Uuid],
+        card_colors: &CardColors,
+        card_width: f32,
     ) -> bool {
         let mut sound_changed = false;
         ui.push_id(("sound_card", sound.id), |ui| {
             let is_selected = self.selected_sounds.contains(&sound.id);
 
-            let card_bg = self.color_from_key("Card Background", [42, 42, 56]);
-            let card_selected = self.color_from_key("Card Selected", [60, 80, 130]);
-            let card_missing = self.color_from_key("Card Missing File", [100, 60, 60]);
-            let card_missing_selected = self.color_from_key("Card Missing Selected", [140, 50, 70]);
-            let btn_normal = self.color_from_key("Button Normal", [48, 52, 70]);
+            let card_bg = card_colors.bg;
+            let card_selected = card_colors.selected;
+            let card_missing = card_colors.missing;
+            let card_missing_selected = card_colors.missing_selected;
+            let btn_normal = card_colors.btn_normal;
 
             let frame_color = if !sound.exists {
                 if is_selected {
@@ -2056,7 +2550,7 @@ impl SoundboardApp {
                 .inner_margin(4.0)
                 .rounding(4.0)
                 .show(ui, |ui| {
-                    ui.set_width(310.0);
+                    ui.set_width(card_width);
                     ui.set_height(54.0);
 
                     let widget_rect = ui.max_rect();
@@ -2264,7 +2758,7 @@ impl SoundboardApp {
                                                 ui.label(format!(
                                                     "Path: {}",
                                                     Self::truncate_name(
-                                                        &sound.path.display().to_string(),
+                                                        sound.path.to_str().unwrap_or(""),
                                                         20
                                                     )
                                                 ));
@@ -2427,6 +2921,28 @@ impl SoundboardApp {
     }
 }
 
+fn parse_cmd_string(cmd: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+
+    for c in cmd.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ' ' if !in_quotes => {
+                if !current.is_empty() {
+                    args.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
+}
+
 impl eframe::App for SoundboardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.keybind_capture.is_some() {
@@ -2499,7 +3015,7 @@ impl eframe::App for SoundboardApp {
         }
 
         let is_playing = self.audio.has_active_sounds();
-        if is_playing {
+        if is_playing || self.active_download_id.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
 

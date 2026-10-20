@@ -18,6 +18,23 @@ pub enum RoutingMode {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct DownloadSettings {
+    pub folder: Option<PathBuf>,
+    pub audio_only: bool,
+    pub embed_thumbnail: bool,
+}
+
+impl Default for DownloadSettings {
+    fn default() -> Self {
+        Self {
+            folder: None,
+            audio_only: true,
+            embed_thumbnail: true,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SoundEntry {
     pub id: Uuid,
     pub name: String,
@@ -73,6 +90,9 @@ pub struct AppSettings {
     pub stop_all_hotkey: Option<String>,
 
     pub colors: HashMap<String, [u8; 3]>,
+
+    #[serde(default)]
+    pub download: DownloadSettings,
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +162,7 @@ impl AppState {
                 direct_targets: Vec::new(),
                 stop_all_hotkey: None,
                 colors: Self::default_colors(),
+                download: DownloadSettings::default(),
             },
         }
     }
