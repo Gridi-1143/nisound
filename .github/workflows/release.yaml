@@ -9,12 +9,12 @@ jobs:
   build-appimage:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libasound2-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libudev-dev libpulse-dev
+          sudo apt-get install -y cmake file pkg-config libasound2-dev libpulse-dev libudev-dev libx11-dev libxext-dev libxrender-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,6 +31,8 @@ jobs:
           sudo mv appimagetool-x86_64.AppImage /usr/local/bin/appimagetool
 
       - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
         run: cargo appimage
 
       - name: Upload Release Asset

@@ -24,3 +24,4 @@ uuid = { version = "1.8.0", features = ["v4", "serde"] }
 [package.metadata.appimage]
 icon = "nisound.svg"
 desktop_entry = "nisound.desktop"
+auto_link = true
