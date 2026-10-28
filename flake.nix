@@ -14,7 +14,6 @@
 
       # for eframe, rodio, symphonia
       runtimeLibs = with pkgs; [
-        cmake
         alsa-lib
         libxkbcommon
         wayland
@@ -55,6 +54,7 @@
         cargoLock.lockFile = ./Cargo.lock;
         
         nativeBuildInputs = with pkgs; [ 
+          cmake
           pkg-config 
           makeWrapper 
           copyDesktopItems 
@@ -74,13 +74,14 @@
         ];
 
         postInstall = ''
-          # mkdir -p $out/share/pixmaps
-          # cp assets/icon.png $out/share/pixmaps/nisound.png
+          install -Dm644 ${./nisound.svg} \
+            $out/share/icons/hicolor/scalable/apps/nisound.svg
         '';
 
         postFixup = ''
           wrapProgram $out/bin/nisound \
-            --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeLibs}"
+            --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeLibs}" \
+            --prefix PATH : "${pkgs.pipewire}/bin"
         '';
       };
 

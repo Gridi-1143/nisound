@@ -20,3 +20,7 @@ toml = "0.8"
 rfd = "0.14.1"
 walkdir = "2.5.0"
 uuid = { version = "1.8.0", features = ["v4", "serde"] }
+
+[package.metadata.appimage]
+icon = "nisound.svg"
+desktop_entry = "nisound.desktop"
