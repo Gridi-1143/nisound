@@ -23,10 +23,23 @@ running the commands above:
 cachix use nisound
 ```
 
+or you can add this
+
+```bash
+  nixConfig = {
+    extra-substituters = [
+      "https://nisound.cachix.org"
+    ];
+    extra-trusted-public-keys = [
+      "nisound.cachix.org-1:xRecNp+wCf9FsSSGEGJD9JpWkN1BUHMI7RjYVdEQ97I="
+    ];
+  };
+```
+
 For a NixOS flake, add the input:
 
 ```nix
-inputs.nisound.url = "github:Gridi-1143/nisound";
+inputs.nisound.url = "github:Gridi-1143/nisound/release";
 ```
 
 Then add the package to your system configuration:
