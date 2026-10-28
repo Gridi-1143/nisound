@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Exec=nisound
+Icon=nisound
+Terminal=false
+Categories=AudioVideo;Audio;
+
+Name=nisound
+Comment=Linux Soundboard

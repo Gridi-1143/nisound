@@ -1,5 +1,5 @@
 {
-  description = "Dev env for Nisound for NixOS";
+  description = "Nisound - A Linux soundboard";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -12,8 +12,9 @@
       overlays = [ (import rust-overlay) ];
       pkgs = import nixpkgs { inherit system overlays; };
 
-      # for eframe/winit, rodio
+      # for eframe, rodio, symphonia
       runtimeLibs = with pkgs; [
+        cmake
         alsa-lib
         libxkbcommon
         wayland
@@ -43,23 +44,50 @@
 
         shellHook = ''
           export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath runtimeLibs}:$LD_LIBRARY_PATH"
-          echo " Nisound Dev Environment Loaded! Run 'cargo run' to start."
+          echo "Nisound Dev Environment Loaded! Run 'cargo run' to start."
         '';
       };
 
-      # basic nix build
       packages.${system}.default = pkgs.rustPlatform.buildRustPackage {
         pname = "nisound";
         version = "0.1.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
         
-        nativeBuildInputs = [ pkgs.pkg-config ];
+        nativeBuildInputs = with pkgs; [ 
+          pkg-config 
+          makeWrapper 
+          copyDesktopItems 
+        ];
+        
         buildInputs = runtimeLibs;
 
-        postFixup = ''
-          patchelf --set-rpath "${pkgs.lib.makeLibraryPath runtimeLibs}" $out/bin/nisound
+        desktopItems = [
+          (pkgs.makeDesktopItem {
+            name = "nisound";
+            exec = "nisound";
+            icon = "nisound";
+            desktopName = "Nisound";
+            comment = "Linux Soundboard";
+            categories = [ "AudioVideo" "Audio" ];
+          })
+        ];
+
+        postInstall = ''
+          # mkdir -p $out/share/pixmaps
+          # cp assets/icon.png $out/share/pixmaps/nisound.png
         '';
+
+        postFixup = ''
+          wrapProgram $out/bin/nisound \
+            --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeLibs}"
+        '';
+      };
+
+      # nix run
+      apps.${system}.default = {
+        type = "app";
+        program = "${self.packages.${system}.default}/bin/nisound";
       };
     };
 }
