@@ -71,40 +71,15 @@ environment.systemPackages = [
 ```
 
 The `release` branch points to the latest stable release successfully uploaded to
-Cachix. The binary package currently supports `x86_64-linux`. Keep Nisound's own
-locked dependencies: overriding its inputs (for example with `nixpkgs.follows`)
-can produce a different package that is not in the cache.
+Cachix.
 
 ### Updating
 
-You do not need to change the input URL for new releases. Flakes pin a revision in
-`flake.lock`, so update your NixOS configuration's lock file and rebuild:
-
 ```bash
 nix flake update nisound
-sudo nixos-rebuild switch --flake .#hostname
 ```
 
-Replace `hostname` with your NixOS configuration name. A regular `nix flake update`
-also updates Nisound. Unattended updates require an update schedule configured on
-your system; the application does not update itself.
-
-For a user-profile installation, use `nix profile list` to find its installed name,
-then run `nix profile upgrade <name>`.
-
-### Publishing releases
-
-Publish a stable GitHub release from `main` with a committed `flake.lock`. The Nix
-workflow builds its tag, uploads the package and runtime dependencies to Cachix,
-and only then advances `release` to that exact commit. Pushes to `main` do not
-trigger a build. Failed builds/uploads leave the channel unchanged, and
-prereleases do not enter the stable channel.
-
-To retry or initialize the channel for an existing release, run **Build Nix
-package** from the Actions tab on `main` and provide the release tag. Only the
-release designated latest by GitHub can advance the channel. Promotion uses a
-fast-forward push, so stable release commits must descend from the current
-`release` commit. Repository rules must allow GitHub Actions to update `release`.
+and rebuild your NixOS
 
 ### AppImage
 
