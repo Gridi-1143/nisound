@@ -32,6 +32,7 @@ jobs:
 
       - uses: actions/checkout@v5
         with:
+          fetch-depth: 0
           ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
 
       - uses: cachix/install-nix-action@v31
