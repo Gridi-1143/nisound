@@ -2,19 +2,37 @@ name: Build Nix package
 
 on:
   release:
-    types: [created]
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Published stable release tag to build (for example v0.1.0)
+        required: true
+        type: string
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: nix-release
+  cancel-in-progress: false
 
 jobs:
   build:
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
     runs-on: ubuntu-latest
     steps:
+      - name: Validate published stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            | jq -e '.draft == false and .prerelease == false'
+
       - uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.release.tag_name || github.ref }}
+          ref: refs/tags/${{ github.event.release.tag_name || inputs.tag }}
 
       - uses: cachix/install-nix-action@v31
         with:
@@ -25,4 +43,22 @@ jobs:
           name: nisound
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
-      - run: nix build .#packages.x86_64-linux.default
+      - run: nix build --no-update-lock-file .#packages.x86_64-linux.default
+
+      # Wait for the complete runtime closure before advertising this revision.
+      - name: Upload package to Cachix
+        run: cachix push nisound ./result
+
+      - name: Promote latest stable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          latest_tag=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" --jq '.tag_name')
+          if [[ "$RELEASE_TAG" != "$latest_tag" ]]; then
+            echo "Cached $RELEASE_TAG; skipping promotion because latest is $latest_tag."
+            exit 0
+          fi
+          # A normal push prevents an older or divergent commit from replacing
+          # the channel, including when an old workflow run is retried.
+          git push origin HEAD:refs/heads/release
